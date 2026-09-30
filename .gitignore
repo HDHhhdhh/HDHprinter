@@ -1,0 +1,10 @@
+# Operator data is local and never part of source control.
+/unit_print_manager_config.json
+/quick_printer_local_paths.json
+/quick_printer_asset_channel.local.json
+/data/
+/output/unit_print_manager/
+/output/print_history*.csv
+__pycache__/
+*.pyc
+.venv/

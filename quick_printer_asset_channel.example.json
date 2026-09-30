@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "remote": "gdrive:",
+  "drive_root_folder_id": "PASTE_PRIVATE_FOLDER_ID_HERE",
+  "remote_prefix": "quick-printer-assets/v1",
+  "rclone_exe": "",
+  "transfers": 12,
+  "checkers": 24,
+  "drive_chunk_size": "64M"
+}

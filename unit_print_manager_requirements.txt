@@ -1,0 +1,5 @@
+ttkbootstrap==2.2.3
+tkinterdnd2==0.6.3
+pypdf==6.19.0
+reportlab==5.0.1
+comtypes==1.4.16
