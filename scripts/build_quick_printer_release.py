@@ -48,7 +48,11 @@ from unit_print_textbooks import (  # noqa: E402
 
 
 APP_FILES = (
+    "unit_print_bootstrap.py",
+    "unit_print_instance.py",
     "unit_print_manager.py",
+    "unit_print_domain.py",
+    "unit_print_execution.py",
     "unit_print_paths.py",
     "unit_print_keyboard.py",
     "unit_print_text_shortcuts.py",
@@ -115,6 +119,7 @@ APP_FILES = (
     "scripts/benchmark_quick_printer_preparation.py",
     "scripts/build_quick_printer_release.py",
     "scripts/quick_printer_asset_sync.py",
+    "scripts/quick_printer_safe_assets.py",
     "scripts/split_quick_printer_release.ps1",
     "scripts/merge_quick_printer_release_parts.ps1",
     "scripts/build_unit_print_catalog.py",

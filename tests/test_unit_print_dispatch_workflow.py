@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -179,6 +181,35 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertTrue(all(self.app.queue_block_status(block) == "완료" for block in self.blocks))
         self.assertIsNone(self.app.retry_batch)
 
+    def test_history_fingerprint_matches_sent_copy_when_source_changes_after_copy(self):
+        from unit_print_device_scheduler import prepare_dispatch_copy
+
+        delivered = {}
+        changed = False
+
+        def copy_then_change_source(source, spool_dir, token):
+            nonlocal changed
+            copy = prepare_dispatch_copy(source, spool_dir, token)
+            if not changed:
+                changed = True
+                source.write_bytes(source.read_bytes() + b"\n% source changed after dispatch copy\n")
+            return copy
+
+        def inspect_send(executable, paths, printer, **options):
+            delivered[str(paths[0])] = hashlib.sha256(paths[0].read_bytes()).hexdigest()
+            return self.monitor.send(executable, paths, printer, **options)
+
+        self.enqueue.side_effect = inspect_send
+        with patch("unit_print_manager.prepare_dispatch_copy", side_effect=copy_then_change_source):
+            records = self.run_worker()
+
+        attempts = [record for record in records if record["event"] == "job_attempt"]
+        self.assertEqual(4, len(attempts))
+        for record in attempts:
+            self.assertEqual(delivered[record["printed_pdf_path"]], record["printed_pdf_sha256"])
+            self.assertEqual(str(self.pdf), record["prepared_pdf_path"])
+        self.assertNotEqual(attempts[0]["pdf_sha256"], attempts[0]["printed_pdf_sha256"])
+
     def test_acceptance_timeout_excludes_sent_job_and_keeps_only_unsent_suffix(self):
         self.monitor.acceptance_timeout = True
         records = self.run_worker()
@@ -342,6 +373,46 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertIsNone(self.app.active_print_block_uid)
         self.assertTrue(self.app.device_resume_event.is_set())
         self.assertEqual(0, self.monitor.pause_count)
+
+    def assert_no_submission_failure_retains_original_jobs(self, records):
+        self.enqueue.assert_not_called()
+        self.assertEqual(self.jobs, self.app.retry_batch.jobs)
+        self.assertFalse(self.app.is_printing)
+        self.assertFalse(self.app.print_accepting_appends)
+        self.assertEqual([], self.app.print_pending_jobs)
+        self.assertEqual(set(), self.app.print_scheduled_block_ids)
+        self.assertEqual(set(), self.app.print_started_block_ids)
+        self.assertIsNone(self.app.print_run_options)
+        self.assertIsNone(self.app.active_print_block_uid)
+        self.assertTrue(self.app.device_resume_event.is_set())
+        self.assertEqual(0, self.monitor.pause_count)
+        self.assertEqual("run_failed", records[-1]["event"])
+        self.assertEqual(0, records[-1]["submitted_jobs"])
+        self.assertEqual(0, records[-1]["uncertain_jobs"])
+        self.assertEqual(len(self.jobs), records[-1]["remaining_jobs"])
+        self.assertNotIn("job_attempt", [record["event"] for record in records])
+
+    def test_rolling_preparation_creation_failure_retains_all_unsent_jobs_and_resets_state(self):
+        with patch("unit_print_manager.PrintPreparationService", side_effect=PermissionError("preparation unavailable")):
+            records = self.run_worker()
+        self.assert_no_submission_failure_retains_original_jobs(records)
+        self.assertEqual("rolling_preparation", records[-1]["phase"])
+
+    def test_missing_monitor_retains_all_unsent_jobs_and_resets_state(self):
+        self.app.device_monitor = None
+        with patch("unit_print_manager.PrintPreparationService") as preparation:
+            records = self.run_worker()
+        preparation.assert_not_called()
+        self.assert_no_submission_failure_retains_original_jobs(records)
+        self.assertEqual("rolling_preparation", records[-1]["phase"])
+
+    def test_legacy_preparation_creation_failure_retains_all_unsent_jobs_and_resets_state(self):
+        self.options = replace(self.options, device_completion_mode=False)
+        self.app.print_run_options = self.options
+        with patch("unit_print_manager.PrintPreparationService", side_effect=PermissionError("preparation unavailable")):
+            records = self.run_worker()
+        self.assert_no_submission_failure_retains_original_jobs(records)
+        self.assertEqual("preparation", records[-1]["phase"])
 
 
 if __name__ == "__main__":

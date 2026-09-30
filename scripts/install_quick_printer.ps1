@@ -9,7 +9,7 @@ $venvPython = Join-Path $appRoot ".venv\Scripts\python.exe"
 function Test-PythonCommand {
     param([string]$Command, [string[]]$Prefix = @())
     try {
-        & $Command @Prefix -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        & $Command @Prefix -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)"
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -28,13 +28,13 @@ function New-AppVenv {
         return
     }
     $py = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($py -and (Test-PythonCommand $py.Source @("-3"))) {
-        & $py.Source -3 -m venv (Join-Path $appRoot ".venv")
+    if ($py -and (Test-PythonCommand $py.Source @("-3.12"))) {
+        & $py.Source -3.12 -m venv (Join-Path $appRoot ".venv")
         return
     }
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
     if (-not $winget) {
-        throw "Python 3.11+과 winget을 찾지 못했습니다. Python 3.12를 먼저 설치해 주세요."
+        throw "Python 3.12와 winget을 찾지 못했습니다. Python 3.12를 먼저 설치해 주세요."
     }
     & $winget.Source install --id Python.Python.3.12 --exact --accept-package-agreements --accept-source-agreements --silent
     if (-not (Test-Path -LiteralPath $python312)) {
@@ -61,6 +61,9 @@ function Find-RcloneExecutable {
 }
 
 Set-Location -LiteralPath $appRoot
+if ((Test-Path -LiteralPath $venvPython) -and (-not (Test-PythonCommand $venvPython))) {
+    throw "기존 .venv가 Python 3.12 환경이 아니거나 실행할 수 없습니다. 이 가상환경을 별도 보관한 뒤 Python 3.12로 .venv를 다시 만들고 설치를 실행해 주세요. 앱 자료와 설정은 지우지 마세요."
+}
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Host "[1/9] Python 가상환경을 준비합니다."
     New-AppVenv
@@ -68,6 +71,13 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 
 Write-Host "[2/9] 앱 패키지를 설치합니다."
 & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $appRoot "unit_print_manager_requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    throw "앱 패키지 설치에 실패했습니다. 네트워크와 Python 환경을 확인한 뒤 설치를 다시 실행해 주세요."
+}
+& $venvPython (Join-Path $PSScriptRoot "verify_quick_printer_environment.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Python 3.12 및 패키지 버전 검증에 실패했습니다. 검증된 환경으로 복구한 뒤 설치를 다시 실행해 주세요."
+}
 
 Write-Host "[3/9] SumatraPDF를 확인합니다."
 $sumatraCandidates = @(
@@ -122,6 +132,8 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "[7/9] Python 소스를 컴파일합니다."
 & $venvPython -m py_compile `
+    (Join-Path $appRoot "unit_print_bootstrap.py") `
+    (Join-Path $appRoot "unit_print_instance.py") `
     (Join-Path $appRoot "unit_print_manager.py") `
     (Join-Path $appRoot "unit_print_paths.py") `
     (Join-Path $appRoot "unit_print_keyboard.py") `

@@ -29,6 +29,23 @@ def digest(data: bytes) -> str:
 
 
 class ReleaseManifestTests(unittest.TestCase):
+    def test_release_covers_bootstrap_requirements_without_operator_state(self) -> None:
+        from unit_print_bootstrap import STARTUP_REQUIRED_FILES
+
+        # The fixed separator is collected with PDFs; every required code/catalog
+        # file must be copied by the application collector.
+        self.assertEqual(
+            {"unit_print_separator_a4.pdf"},
+            set(STARTUP_REQUIRED_FILES) - set(APP_FILES),
+        )
+        for name in APP_FILES:
+            self.assertTrue((PROJECT_ROOT / name).is_file(), name)
+            self.assertNotIn("/recovery/", name)
+            self.assertNotIn("/startup_logs/", name)
+        self.assertNotIn("quick_printer_local_paths.json", APP_FILES)
+        self.assertNotIn("unit_print_manager_config.json", APP_FILES)
+        self.assertIn("scripts/quick_printer_safe_assets.py", APP_FILES)
+
     def test_print_history_and_queue_modules_ship_without_runtime_history(self) -> None:
         for name in (
             "unit_print_queue_state.py",

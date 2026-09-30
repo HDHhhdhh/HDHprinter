@@ -11,7 +11,11 @@ Its current product contract is `빠른인쇄기_제품동작_정본.md`; operat
 
 ```text
 ./
-├── unit_print_manager.py              # Tkinter app, data models, active UI, queue, print orchestration
+├── unit_print_bootstrap.py            # Stdlib startup checks, single-instance lease, redacted diagnostics
+├── unit_print_instance.py             # Same-user Global Windows mutex, independent of installation path
+├── unit_print_manager.py              # Active Tkinter UI, catalogs, queue editing, integration boundary
+├── unit_print_domain.py               # Print models, pure job/routing/name/OMR/A:ble rules
+├── unit_print_execution.py            # PrintExecutionMixin and explicit execution-service dependencies
 ├── unit_print_paths.py                # Configurable local/bundled asset root and legacy compatibility
 ├── unit_print_catalog.json            # Built-in subject/level/round/file catalog, relative to root_dir
 ├── unit_print_materials.py            # APEX, A:ble, training/frequent-type catalogs and page assembly
@@ -56,7 +60,7 @@ Its current product contract is `빠른인쇄기_제품동작_정본.md`; operat
 
 | Task | Location | Notes |
 |---|---|---|
-| Launch behavior | `run_unit_print_manager.cmd`, `run_unit_print_manager_hidden.vbs`, `main()` | Launchers prefer `.venv\Scripts\pythonw.exe`, then local Python 3.12. |
+| Launch behavior | `unit_print_bootstrap.main()`, CMD/VBS launchers, `unit_print_instance.py` | Python 3.12; one Global mutex per Windows user SID before manager import. Errors show a notice and redacted log. |
 | UI layout | `PrintManagerApp.build_ui_reset()` in `unit_print_manager.py` | The single active UI builder; obsolete reference UI was removed. |
 | Queue refresh/render | `refresh_queue_selection()`, `update_queue_view()`, `unit_print_queue_render.py` | Selection refresh skips history/totals; model mutations retain them. Paint only visible rows, but scroll/navigation must use the full scrollregion. |
 | Asset roots | `unit_print_paths.resolve_release_root()`, `select_configured_root()` | Environment override, local path config, bundled data, then per-catalog legacy fallback. |
@@ -64,7 +68,7 @@ Its current product contract is `빠른인쇄기_제품동작_정본.md`; operat
 | Textbook catalog | `unit_print_textbooks.py`, `unit_print_textbook_catalog.json` | Only complete verified editions are selectable; any incomplete edition stays `pending` with no lesson ranges. |
 | Queue editing | `add_current_block`, `add_custom_pdf_block`, `commit_selected_block_replacement`, drag handlers | Started/submitted blocks are protected; unstarted scheduled blocks may be deleted and name groups are repaired. |
 | Preview/preflight | `update_preview()`, `unit_print_pdf_printing.py` | Calculates job order, copies, layouts, missing/invalid PDFs, and separators; preserve programmatic dry-run checks. |
-| Print dispatch/retry | `start_print_thread()`, `print_blocks()`, `unit_print_retry.py` | Background sending, active-run appends, stop and retry; already sent blocks are excluded. |
+| Print dispatch/retry | `unit_print_execution.PrintExecutionMixin`, `unit_print_retry.py` | Background sending, active-run appends, stop and retry; explicit services supplied by manager. Already sent blocks are excluded. |
 | Queue state | `unit_print_queue_state.waiting_blocks()`, `retain_visible_retry_jobs()`, `QueueSnapshot` | Preserve block identity and completed/retry state across queue edits and undo. |
 | Manual queue recovery | `show_queue_recovery()`, `restore_recovery_blocks()`, `unit_print_queue_recovery.py`, `unit_print_recovery_history.py` | Empty/idle queue only; source lease, fresh snapshot/history/consumption checks, preflight, required record and receipt precede commit. Never auto-print. |
 | Printer destination verification | `ensure_device_printer_binding()`, `assert_device_binding_for_dispatch()`, `unit_print_printer_binding.py` | Validate actual body/name/separator/OMR TCP/IP targets before start/retry/append; retain approved names and monitor identity during dispatch. |
@@ -77,10 +81,11 @@ Its current product contract is `빠른인쇄기_제품동작_정본.md`; operat
 | Catalog rebuild | `scripts/build_unit_print_catalog.py` | Imports app scan helpers and writes `unit_print_catalog.json`. |
 | Server CSV | `unit_print_orders.py`, `unit_print_server_catalog.py` | Resolve exact material IDs, student-name separators, and automatic OMR jobs. |
 | Release/asset sync | `scripts/build_quick_printer_release.py`, `verify_quick_printer_release.py`, `quick_printer_asset_sync.py` | Full baseline plus manifest-based PDF updates; do not delete extra assets automatically. |
+| Safe local asset copies | `scripts/quick_printer_safe_assets.py` | Verify size/SHA/pages in inherited-access staging; publish only a complete new directory. Preserve source and existing destinations. |
 
 ## CODE MAP
 
-The following symbols are in `unit_print_manager.py`; search by symbol rather than keeping unstable line numbers here.
+Search by symbol rather than keeping unstable line numbers here. Models and pure rules live in `unit_print_domain.py`; execution methods live in `unit_print_execution.py` and are inherited by the app.
 
 | Symbol | Role |
 |---|---|
@@ -90,10 +95,13 @@ The following symbols are in `unit_print_manager.py`; search by symbol rather th
 | `PrintManagerApp` | GUI, queue state, local settings, preview, and print orchestration. |
 | `build_print_jobs()` | Expands blocks into order, bundled copies, name/general separators, and OMR. |
 | `print_blocks()` | Sends jobs, updates state, preserves retry work, and watches the Windows print queue. |
+| `PrintExecutionServices` | Immutable explicit callbacks/constants at the manager/execution boundary; no import back into manager. |
+| `unit_print_bootstrap.main()` | Checks the startup environment and owns the instance lease throughout `run_application()`. |
 
 ## OPERATOR FLOW
 
 1. Start with an empty queue and every copies input set to 1; the initial selection is `테스트 > 단원평가`.
+   Starting a second copy under the same Windows user shows a notice without creating a queue or GUI, even from a different installation or Windows session. Other users/PCs and external print apps are outside this lock. An already-running pre-patch process must exit normally before the next launch gains protection.
 2. Use the five main tabs: `테스트 / 교재자료 / 백지리뷰/OMR / PDF파일 / 대량주문서`. The test tabs are `단원평가 / 복습테스트 / 학군지기출 / 일산기출`; the last material tab is `교과서`, with nested `교과서 / 핵심문제 변형` tabs.
 3. Select material and range/individual numbers, copies, and student name when applicable; add a block. Direct PDFs also support multiple-file drag-and-drop and a per-block printer route.
 4. Import server or detailed order CSVs through `대량주문서` to create multiple validated blocks at once. Each imported batch is stably sorted by the NFC-normalized name-separator label in Korean Unicode order; blocks for the same student keep CSV-relative order, unnamed blocks follow named blocks, and pre-existing queue items are not reordered.
@@ -117,6 +125,7 @@ The following symbols are in `unit_print_manager.py`; search by symbol rather th
 - Config persists operator paths, printer, Sumatra path, custom PDF defaults, queue pacing, separator flags, and engine. `save_current_config()` writes copies as 1, duplex as true, and `blocks` as `[]`; restarting never restores old print work.
 - The fixed one-page separator asset is landscape `unit_print_separator_a4.pdf`; its centered `구분지` label leaves about 10% side margins.
 - History stays beside the app at `output/unit_print_manager/history/YYYY-MM-DD.jsonl`, independent of the PDF data root. Dates and timestamp offsets follow the OS local timezone. Records include session/run/block/job IDs, student/order/material metadata, files, copies, printers, and event outcomes.
+- Canon `printed_pdf` history fingerprints the exact dispatched spool-copy bytes. `prepared_pdf_path` separately identifies the build source. Spool-copy removal accepts only tokenized direct children of the owned device spool directory and refuses originals/symlinks/outside paths.
 - History is an audit record, not persisted retry state: reopening still starts with an empty queue. Do not add automatic reprinting or date-based history deletion without a requested product change.
 - Queue mutations save full metadata asynchronously under `output/unit_print_manager/recovery/session-UUID.json`. Empty/new sessions do not overwrite a previous backup. `큐 도구` and queue-focused Ctrl+S/Ctrl+Shift+O expose explicit save/recovery. Restore only whole blocks with no dispatch evidence; already submitted, uncertain, partially sent, or previously recovered blocks stay review-only. Source leases reject recovery from another live instance. Consumption sidecars are required proof, never reset when writing a new snapshot; missing/corrupt receipts or source history fail closed. Copies, layout, route, ordering and source metadata survive with fresh block IDs. PDF files are not copied by snapshots, so restore preflights all selected paths.
 - Recovery snapshots and receipts contain student information and must stay out of Git and release bundles. Snapshot publication coalesces edits; selection navigation does not save. The dispatch proof uses the existing required `job_attempt` record, with no extra per-PDF recovery fsync.
@@ -151,6 +160,7 @@ Use `.venv\Scripts\python.exe` instead of `python` when using the app virtual en
 ## GOTCHAS
 
 - The GUI class remains large. Put new pure state, parsing, persistence, and print-domain logic in focused modules, keeping UI integration small.
+- Every supported entry point delegates to bootstrap before manager imports. Do not call `run_application()` from a new launcher without the bootstrap lease. Startup checks are file-existence/package checks, not a scan or hash of all PDFs. Diagnostics omit raw exception messages and locals because they may contain student information or credentials.
 - `build_ui_reset()` is the active UI path; do not recreate an unused parallel UI implementation.
 - A submitted or process-boundary-uncertain Sumatra job must advance out of retry eligibility before any later history write. Pre-dispatch history failure retains the unsent job. Confirmed and uncertain counts are distinct; test the production worker rather than an unused state wrapper.
 - Preview worker exceptions must publish completion and release active/poll state. Do not immediately reschedule a failed PDF forever; explicit requests may retry and actual printing still requires preflight.

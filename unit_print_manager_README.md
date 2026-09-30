@@ -9,6 +9,10 @@
 콘솔 창 없이 직접 실행하려면 `run_unit_print_manager_hidden.vbs`를 사용합니다.
 `run_unit_print_manager.cmd`도 `pythonw`로 앱을 띄우고 바로 종료되도록 설정되어 있습니다.
 
+Python 3.12 환경을 사용합니다. 모든 실행 경로는 `unit_print_bootstrap.py`에서 필수 코드 파일과 의존성을 먼저 확인한 뒤 앱을 시작합니다. 시작 검사에서 등록 PDF 전체를 읽거나 해시를 계산하지 않습니다. 파일 누락·환경 문제·초기화 실패가 있으면 원인과 진단 로그 위치를 안내합니다. 로그는 `output/unit_print_manager/startup_logs`에 저장하며, 그 위치에 쓸 수 없으면 `%LOCALAPPDATA%/QuickPrinter/startup_logs`, 임시 폴더 순으로 저장합니다. 예외 원문·설정값·PIN은 기록하지 않습니다.
+
+같은 Windows 사용자는 설치 폴더나 Windows 세션이 달라도 앱을 하나만 실행할 수 있습니다. 두 번째 실행은 새 작업 큐를 만들지 않고 기존 창을 확인하라는 안내를 표시합니다. 정상 종료 또는 프로세스 종료 시 Windows 잠금이 해제됩니다. 다른 PC·다른 사용자나 외부 인쇄 프로그램의 전송까지 막는 기능은 아닙니다. 패치 전에 켜 둔 앱에는 새 잠금이 없으므로 작업을 마친 뒤 정상 종료하고 다시 실행해야 적용됩니다.
+
 처음 실행 전 필요한 패키지:
 
 ```powershell
@@ -17,7 +21,7 @@ python -m pip install -r unit_print_manager_requirements.txt
 
 기본값:
 
-- 현재 PC 자료 기준본: `C:\Users\gkseh\Documents\빠른인쇄기_자료\data`
+- 현재 PC 자료 기준본: `C:\Users\gkseh\Documents\빠른인쇄기_자료_검증본_전체\data`
 - 로컬 경로 설정: `quick_printer_local_paths.json`
 - 자료 루트 선택: `QUICK_PRINTER_RELEASE_ROOT` 환경변수 → 로컬 설정의 `release_root` → 앱 폴더 순서이며, 선택한 루트 아래 `data`를 사용
 - 호환용 원본: 선택한 자료 루트에 해당 종류의 폴더·파일이 없으면 과거 C/D드라이브 원본 경로를 조회. 설정에서 별도로 지정한 유효한 자료 폴더도 유지
