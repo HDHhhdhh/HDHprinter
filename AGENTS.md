@@ -61,6 +61,7 @@ Its current product contract is `빠른인쇄기_제품동작_정본.md`; operat
 | Task | Location | Notes |
 |---|---|---|
 | Launch behavior | `unit_print_bootstrap.main()`, CMD/VBS launchers, `unit_print_instance.py` | Python 3.12; one Global mutex per Windows user SID before manager import. Errors show a notice and redacted log. |
+| Startup hang diagnostics | `unit_print_bootstrap.StartupTrace`, `run_application()` | Best-effort phase/elapsed/window-mapped records; distinguish slow catalogs from import errors. No operator fields. |
 | UI layout | `PrintManagerApp.build_ui_reset()` in `unit_print_manager.py` | The single active UI builder; obsolete reference UI was removed. |
 | Queue refresh/render | `refresh_queue_selection()`, `update_queue_view()`, `unit_print_queue_render.py` | Selection refresh skips history/totals; model mutations retain them. Paint only visible rows, but scroll/navigation must use the full scrollregion. |
 | Asset roots | `unit_print_paths.resolve_release_root()`, `select_configured_root()` | Environment override, local path config, bundled data, then per-catalog legacy fallback. |
@@ -161,6 +162,7 @@ Use `.venv\Scripts\python.exe` instead of `python` when using the app virtual en
 
 - The GUI class remains large. Put new pure state, parsing, persistence, and print-domain logic in focused modules, keeping UI integration small.
 - Every supported entry point delegates to bootstrap before manager imports. Do not call `run_application()` from a new launcher without the bootstrap lease. Startup checks are file-existence/package checks, not a scan or hash of all PDFs. Diagnostics omit raw exception messages and locals because they may contain student information or credentials.
+- APEX analysis runs before the full GUI is built and uses relative path, size, and mtime cache signatures. Verified local PDF copies must preserve mtime; do not weaken signatures or retag a changed PDF to force a hit. A relocation needs unchanged bytes plus matching metadata. Keep a real withdrawn-root constructor/idle regression in addition to `__new__` worker fixtures. Startup traces indicate logical Tk mapping, not visual QA.
 - `build_ui_reset()` is the active UI path; do not recreate an unused parallel UI implementation.
 - A submitted or process-boundary-uncertain Sumatra job must advance out of retry eligibility before any later history write. Pre-dispatch history failure retains the unsent job. Confirmed and uncertain counts are distinct; test the production worker rather than an unused state wrapper.
 - Preview worker exceptions must publish completion and release active/poll state. Do not immediately reschedule a failed PDF forever; explicit requests may retry and actual printing still requires preflight.

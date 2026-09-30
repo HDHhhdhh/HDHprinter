@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import tempfile
 import threading
@@ -163,7 +164,7 @@ class BootstrapTests(unittest.TestCase):
     def test_later_callback_failure_writes_log_and_keeps_main_lease_until_loop_exit(self):
         lease = Lease()
 
-        def app(*, error_handler):
+        def app(*, error_handler, startup_report=None):
             lease.close.assert_not_called()
             try:
                 raise ValueError("private student data")
@@ -181,7 +182,7 @@ class BootstrapTests(unittest.TestCase):
     def test_thread_exception_hook_logs_then_restores_after_run(self):
         old_hook = threading.excepthook
 
-        def app(*, error_handler):
+        def app(*, error_handler, startup_report=None):
             error = RuntimeError("PIN=9999")
             threading.excepthook(types.SimpleNamespace(exc_value=error, exc_traceback=None))
 
@@ -194,7 +195,7 @@ class BootstrapTests(unittest.TestCase):
     def test_recursive_entry_does_not_acquire_second_reentrant_windows_mutex_or_gui(self):
         second_factory, second_import = Mock(), Mock()
 
-        def app(*, error_handler):
+        def app(*, error_handler, startup_report=None):
             result = bootstrap.main(
                 app_root=self.root, instance_factory=second_factory, importer=second_import,
                 validator=Mock(), notify=self.notify,
@@ -226,6 +227,31 @@ class BootstrapTests(unittest.TestCase):
         self.assertIsNotNone(log)
         self.assertIn(fallback, log.parents)
         self.assertNotIn("confidential-fixture-8246", log.read_text(encoding="utf-8"))
+
+    def test_successful_launch_records_phase_and_window_ready_without_operator_data(self):
+        def app(*, error_handler, startup_report):
+            startup_report("ui_constructed")
+            startup_report("gui_ready", mapped=True)
+
+        self.assertEqual(0, self.launch(importer=Mock(return_value=types.SimpleNamespace(run_application=app))))
+        traces = list((self.root / "output/unit_print_manager/startup_logs").glob("*_trace.jsonl"))
+        self.assertEqual(1, len(traces))
+        records = [json.loads(line) for line in traces[0].read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(["instance_acquired", "validation", "import", "application", "ui_constructed", "gui_ready", "application_returned"],
+                         [r["phase"] for r in records])
+        self.assertTrue(records[-2]["mapped"])
+        self.assertTrue(all(set(r) <= {"phase", "elapsed_ms", "mapped"} for r in records))
+        self.assertEqual([], self.logs())
+
+    def test_trace_write_failure_does_not_prevent_gui_or_leak_instance_lease(self):
+        lease = Lease()
+        app = Mock()
+        with patch.object(Path, "open", side_effect=OSError("disk unavailable")):
+            result = self.launch(lease=lease, importer=Mock(return_value=types.SimpleNamespace(run_application=app)))
+        self.assertEqual(0, result)
+        app.assert_called_once()
+        lease.close.assert_called_once()
+        self.notify.assert_not_called()
 
     def test_safe_traceback_omits_exception_chain_messages_and_frame_locals(self):
         try:

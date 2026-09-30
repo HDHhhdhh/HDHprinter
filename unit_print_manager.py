@@ -14210,14 +14210,20 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
 
 
-def run_application(*, error_handler=None) -> None:
+def run_application(*, error_handler=None, startup_report=None) -> None:
     set_windows_app_user_model_id()
     set_windows_dpi_awareness()
     root = TkinterDnD.Tk() if TkinterDnD is not None else Tk()
     if error_handler is not None:
         root.report_callback_exception = error_handler
     try:
+        if startup_report is not None:
+            startup_report("catalog_and_ui_start")
         PrintManagerApp(root)
+        if startup_report is not None:
+            startup_report("ui_constructed")
+            root.after_idle(lambda: startup_report("gui_ready", mapped=bool(root.winfo_viewable())))
+            root.after(2000, lambda: startup_report("gui_stable", mapped=bool(root.winfo_viewable())))
         root.mainloop()
     finally:
         try:

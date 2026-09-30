@@ -54,6 +54,31 @@ class VerifiedAssetCopyTests(unittest.TestCase):
         self.assertEqual(self.spec.sha256, saved["files"][0]["sha256"])
         self.assertEqual(2, saved["files"][0]["page_count"])
 
+    def test_relocated_apex_pdf_reuses_existing_analysis_without_extracting_text(self) -> None:
+        from unit_print_materials import load_apex_catalog
+
+        source = self.root / "APEX algebra.pdf"
+        source.write_bytes(self.original)
+        os.utime(source, ns=(1600000000000000000, 1600000000123456700))
+        spec = replace(self.spec, source=source, relative_path=source.name)
+        cache = self.root / "material_catalog.json"
+        load_apex_catalog(self.root, cache)
+        self.publish([spec])
+        copied = self.final / source.name
+        self.assertEqual(source.stat().st_mtime_ns, copied.stat().st_mtime_ns)
+        with patch("unit_print_materials.analyze_apex_document", side_effect=AssertionError("unchanged PDF must use cache")):
+            result = load_apex_catalog(self.final, cache)
+        self.assertEqual(1, len(result.documents))
+        self.assertEqual(copied, result.documents[0].path)
+        self.assertEqual(2, result.documents[0].page_count)
+
+    def test_timestamp_preservation_failure_never_publishes_final(self) -> None:
+        with patch.object(assets.os, "utime", side_effect=OSError("timestamp failure")):
+            with self.assertRaises(OSError):
+                self.publish()
+        self.assertFalse(self.final.exists())
+        self.assertEqual(self.original, self.source.read_bytes())
+
     @unittest.skipUnless(os.name == "nt", "Windows directory ACL regression")
     def test_published_directory_inherits_parent_windows_acl(self) -> None:
         import ctypes

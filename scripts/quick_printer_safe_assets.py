@@ -128,6 +128,12 @@ def _copy_verified(item: AssetSpec, target: Path) -> tuple[int, int, int, int, i
         raise AssetCopyError(f"복사본 해시가 검증값과 다릅니다: {item.relative_path}")
     if item.page_count is not None and _page_count(target) != item.page_count:
         raise AssetCopyError(f"복사본 PDF 페이지 수가 검증값과 다릅니다: {item.relative_path}")
+    # Catalog analysis caches use relative path + size + mtime. Preserve the
+    # verified source mtime so relocating identical PDFs does not force costly
+    # full-text analysis before the operator window can be created.
+    os.utime(target, ns=(item.source.stat().st_atime_ns, before[1]))
+    if target.stat().st_mtime_ns != before[1]:
+        raise AssetCopyError(f"복사본 수정 시각을 보존하지 못했습니다: {item.relative_path}")
     return before
 
 

@@ -5,10 +5,12 @@ from __future__ import annotations
 import ctypes
 import importlib
 import importlib.util
+import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -100,6 +102,51 @@ def safe_traceback(error: BaseException) -> str:
     return "\n".join(output) + "\n"
 
 
+def diagnostic_directories(app_root: Path) -> list[Path]:
+    candidates = [app_root / "output" / "unit_print_manager" / "startup_logs"]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "QuickPrinter" / "startup_logs")
+    candidates.append(Path(tempfile.gettempdir()) / "QuickPrinter" / "startup_logs")
+    return candidates
+
+
+class StartupTrace:
+    """Small best-effort phase log, including hangs that never raise an exception."""
+
+    def __init__(self, app_root: Path) -> None:
+        self.started = time.monotonic()
+        self.stream = None
+        filename = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{os.getpid()}_{uuid.uuid4().hex[:8]}_trace.jsonl"
+        for directory in diagnostic_directories(app_root):
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                self.stream = (directory / filename).open("x", encoding="utf-8", newline="\n")
+                break
+            except OSError:
+                continue
+
+    def record(self, phase: str, *, mapped: bool | None = None) -> None:
+        if self.stream is None:
+            return
+        record = {"phase": phase, "elapsed_ms": round((time.monotonic() - self.started) * 1000, 2)}
+        if mapped is not None:
+            record["mapped"] = bool(mapped)
+        try:
+            self.stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.stream.flush()
+        except OSError:
+            self.close()
+
+    def close(self) -> None:
+        if self.stream is not None:
+            stream, self.stream = self.stream, None
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 def write_diagnostic(app_root: Path, error: BaseException, phase: str) -> Path | None:
     filename = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{os.getpid()}_{uuid.uuid4().hex[:8]}.log"
     content = (
@@ -108,12 +155,7 @@ def write_diagnostic(app_root: Path, error: BaseException, phase: str) -> Path |
         + f"Phase: {phase}\nPython: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n"
         + safe_traceback(error)
     )
-    candidates = [app_root / "output" / "unit_print_manager" / "startup_logs"]
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        candidates.append(Path(local_app_data) / "QuickPrinter" / "startup_logs")
-    candidates.append(Path(tempfile.gettempdir()) / "QuickPrinter" / "startup_logs")
-    for directory in candidates:
+    for directory in diagnostic_directories(app_root):
         try:
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / filename
@@ -170,6 +212,7 @@ def main(*, app_root: Path | None = None, instance_factory=None, importer=None, 
         return 0
     reporter = ErrorReporter(app_root, notify)
     lease = None
+    trace = None
     previous_thread_hook = threading.excepthook
     phase = "instance"
     try:
@@ -182,18 +225,28 @@ def main(*, app_root: Path | None = None, instance_factory=None, importer=None, 
         if not lease.acquire():
             notify("빠른 인쇄기가 이미 실행 중입니다.\n작업 표시줄에서 기존 빠른 인쇄기 창을 확인해 주세요.", error=False)
             return 0
+        trace = StartupTrace(app_root)
+        trace.record("instance_acquired")
         phase = "validation"
+        trace.record(phase)
         (validator or validate_startup)(app_root)
         phase = "import"
+        trace.record(phase)
         manager = (importer or importlib.import_module)("unit_print_manager")
         threading.excepthook = lambda args: reporter.report(args.exc_value.with_traceback(args.exc_traceback), "thread")
         phase = "application"
-        manager.run_application(error_handler=reporter.callback_exception)
+        trace.record(phase)
+        manager.run_application(error_handler=reporter.callback_exception, startup_report=trace.record)
+        trace.record("application_returned")
         return 0
     except Exception as error:
+        if trace is not None:
+            trace.record("failed_" + phase)
         reporter.report(error, phase)
         return 1
     finally:
+        if trace is not None:
+            trace.close()
         threading.excepthook = previous_thread_hook
         try:
             if lease is not None:
