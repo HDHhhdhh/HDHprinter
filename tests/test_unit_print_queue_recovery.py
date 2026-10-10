@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import unit_print_queue_recovery as recovery
 from unit_print_queue_recovery import (
     RecoveryReadError,
     RecoverySessionActiveError,
@@ -57,6 +58,17 @@ def snapshot(*, session: str = SESSION_1, sequence: int = 1) -> dict:
 
 
 class RecoveryValidationTests(unittest.TestCase):
+    def test_utf8_validation_keeps_surrogate_and_boundary_rules(self) -> None:
+        payload = snapshot()
+        for codepoint in range(0xD800, 0xE000):
+            with self.subTest(codepoint=codepoint):
+                payload["queue"][0]["block"]["name_separator_label"] = chr(codepoint)
+                with self.assertRaises(RecoveryValidationError):
+                    validate_snapshot(payload)
+        for codepoint in (0xD7FF, 0xE000, 0xFFFF, 0x10000, 0x10FFFF):
+            payload["queue"][0]["block"]["name_separator_label"] = chr(codepoint)
+            validate_snapshot(payload)
+
     def test_does_not_coerce_or_normalize_exact_block_metadata(self) -> None:
         payload = snapshot()
         original = copy.deepcopy(payload)
@@ -248,6 +260,147 @@ class RecoveryStoreTests(unittest.TestCase):
 
 
 class RecoveryWriterTests(unittest.TestCase):
+    def test_captured_submit_validates_on_worker_before_any_disk_side_effect(self) -> None:
+        mutations = (
+            lambda p: p.update(schema_version=True),
+            lambda p: p.update(session_id="../../outside"),
+            lambda p: p["queue"][0]["block"].update(copies="3"),
+            lambda p: p["queue"][0]["block"]["files"][0].update(path="bad\x00path"),
+            lambda p: p.pop("session_started_at"),
+            lambda p: p.update(reason="bad\ud800text"),
+            lambda p: p.update(queue=[], schema_version=2),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                with tempfile.TemporaryDirectory() as temporary:
+                    directory = Path(temporary) / "never-created"
+                    store = RecoveryStore(directory)
+                    writer = RecoveryWriter(store)
+                    payload = snapshot()
+                    mutate(payload)
+                    with patch.object(store, "_lease_path", side_effect=AssertionError("invalid capture acquired a lease")), \
+                         patch.object(store, "_initialize_consumption_receipt", side_effect=AssertionError("invalid capture wrote a receipt")), \
+                         patch.object(store, "_atomic_write", side_effect=AssertionError("invalid capture published bytes")):
+                        revision = writer.submit_captured(payload)
+                        with self.assertRaises(RecoveryWriteError):
+                            writer.flush(revision, timeout=2)
+                        self.assertIsInstance(writer.pop_error(), RecoveryWriteError)
+                        self.assertIsNone(writer.pop_error())
+                        with self.assertRaises(RecoveryWriteError):
+                            writer.close(timeout=2)
+                    self.assertFalse(directory.exists())
+
+    def test_captured_submit_byte_limit_fails_before_lease_or_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "never-created"
+            writer = RecoveryWriter(RecoveryStore(directory))
+            with patch.object(recovery, "MAX_SNAPSHOT_BYTES", 1):
+                revision = writer.submit_captured(snapshot())
+                with self.assertRaises(RecoveryWriteError):
+                    writer.flush(revision, timeout=2)
+                with self.assertRaises(RecoveryWriteError):
+                    writer.close(timeout=2)
+            self.assertFalse(directory.exists())
+
+    def test_captured_submit_detaches_before_return_and_coalesces_while_validation_blocks(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        original_encode = recovery._encoded_snapshot
+
+        def blocked_encode(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("test validation gate")
+            return original_encode(payload)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "recovery"
+            store = RecoveryStore(directory)
+            writer = RecoveryWriter(store)
+            try:
+                with patch.object(recovery, "_encoded_snapshot", side_effect=blocked_encode):
+                    first = snapshot(sequence=1)
+                    writer.submit_captured(first)
+                    self.assertTrue(started.wait(2))
+                    self.assertTrue(writer.busy)
+                    self.assertFalse(directory.exists(), "validation must precede even directory creation")
+                    first["queue"][0]["block"]["copies"] = 99
+                    second = snapshot(sequence=2)
+                    writer.submit_captured(second)
+                    latest = snapshot(sequence=3)
+                    writer.submit_captured(latest)
+                    latest["queue"][0]["block"]["files"][0]["path"] = "mutated.pdf"
+                    latest["queue"][0]["block"]["selected_numbers"].append(100)
+                    latest["run"]["is_printing"] = True
+                    # All three submits returned while worker validation was
+                    # blocked. Only the newest pending capture survives.
+                    self.assertFalse(release.is_set())
+                    release.set()
+                    writer.flush(timeout=3)
+                self.assertEqual(["snapshot-1", "snapshot-3"], [item["snapshot_id"] for item in calls])
+                self.assertEqual(3, calls[0]["queue"][0]["block"]["copies"])
+                saved = store.load()
+                self.assertEqual("D:/테스트/7.pdf", saved["queue"][0]["block"]["files"][0]["path"])
+                self.assertEqual([7, 9], saved["queue"][0]["block"]["selected_numbers"])
+                self.assertFalse(saved["run"]["is_printing"])
+            finally:
+                release.set()
+                writer.close(timeout=3)
+
+    def test_captured_submit_rejects_other_session_before_its_snapshot_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RecoveryStore(Path(temporary))
+            writer = RecoveryWriter(store)
+            try:
+                writer.save_required(snapshot(), timeout=2)
+                before_names = {path.name for path in store.directory.iterdir()}
+                before = {path.name: path.read_bytes() for path in store.directory.glob("*.json")}
+                revision = writer.submit_captured(snapshot(session=SESSION_2))
+                with self.assertRaises(RecoveryWriteError):
+                    writer.flush(revision, timeout=2)
+                after = {path.name: path.read_bytes() for path in store.directory.glob("*.json")}
+                self.assertEqual(before, after)
+                self.assertEqual(before_names, {path.name for path in store.directory.iterdir()})
+                writer.save_required(snapshot(sequence=2), timeout=2)
+            finally:
+                writer.close(timeout=2)
+
+    def test_manual_submit_and_save_required_still_validate_synchronously(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "never-created"
+            writer = RecoveryWriter(RecoveryStore(directory))
+            invalid = snapshot()
+            invalid["queue"][0]["block"]["copies"] = "3"
+            for submit in (writer.submit, writer.save_required):
+                with self.subTest(submit=submit):
+                    with self.assertRaises(RecoveryValidationError):
+                        submit(invalid)
+                    self.assertIsNone(writer._thread)
+                    self.assertFalse(writer.busy)
+                    self.assertFalse(directory.exists())
+            writer.close(timeout=2)
+
+    def test_captured_submit_uses_store_save_override_after_validation(self) -> None:
+        seen = []
+
+        class Store(RecoveryStore):
+            def save(self, payload):
+                seen.append(payload)
+                return super().save(payload)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary))
+            writer = RecoveryWriter(store)
+            try:
+                writer.flush(writer.submit_captured(snapshot()), timeout=2)
+                self.assertEqual([snapshot()], seen)
+                self.assertEqual(snapshot(), store.load())
+            finally:
+                writer.close(timeout=2)
+
     def test_pending_writes_coalesce_without_mutating_submitted_payloads(self) -> None:
         started = threading.Event()
         release = threading.Event()

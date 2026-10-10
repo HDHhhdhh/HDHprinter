@@ -23,8 +23,9 @@ _ENTRY_LOCK = threading.Lock()
 # File existence only. PDF hashing and catalog validation belong to preflight/release checks.
 STARTUP_REQUIRED_FILES = (
     "unit_print_bootstrap.py", "unit_print_instance.py", "unit_print_manager.py",
-    "unit_print_domain.py", "unit_print_execution.py",
-    "unit_print_paths.py", "unit_print_keyboard.py", "unit_print_text_shortcuts.py",
+    "unit_print_domain.py", "unit_print_execution.py", "unit_print_theme.py", "unit_print_preview.py",
+    "unit_print_typography.py",
+    "unit_print_paths.py", "unit_print_source_paths.py", "unit_print_keyboard.py", "unit_print_text_shortcuts.py",
     "unit_print_gyopyeong.py", "unit_print_selected_exams.py", "unit_print_orders.py",
     "unit_print_server_catalog.py", "unit_print_materials.py", "unit_print_name_separator.py",
     "unit_print_pdf_printing.py", "unit_print_pdf_metadata.py", "unit_print_device_state.py",

@@ -27,6 +27,44 @@ class Variable:
 
 
 class UiPerformanceTests(unittest.TestCase):
+    def test_processing_button_refresh_changes_only_presentation_once_per_transition(self):
+        class Button:
+            def __init__(self):
+                self.flags = set()
+                self.text = "인쇄 시작"
+                self.writes = []
+
+            def state(self, flags=None):
+                if flags is not None:
+                    self.writes.append(tuple(flags))
+                    for flag in flags:
+                        self.flags.discard(flag[1:]) if flag.startswith("!") else self.flags.add(flag)
+                return tuple(self.flags)
+
+            def cget(self, option):
+                return self.text
+
+            def configure(self, **options):
+                self.writes.append(options)
+                self.text = options["text"]
+
+        app = PrintManagerApp.__new__(PrintManagerApp)
+        app.start_print_button = Button()
+        app.is_printing = False
+        app.refresh_print_action_buttons()
+        self.assertEqual([], app.start_print_button.writes)
+        app.is_printing = True
+        app.refresh_print_action_buttons()
+        writes = list(app.start_print_button.writes)
+        app.refresh_print_action_buttons()
+        self.assertEqual(writes, app.start_print_button.writes)
+        self.assertEqual("인쇄 중", app.start_print_button.text)
+        self.assertEqual({"alternate"}, app.start_print_button.flags)
+        app.is_printing = False
+        app.refresh_print_action_buttons()
+        self.assertEqual("인쇄 시작", app.start_print_button.text)
+        self.assertEqual(set(), app.start_print_button.flags)
+
     def test_slow_material_request_keeps_later_pdf_block_in_user_order(self) -> None:
         app = PrintManagerApp.__new__(PrintManagerApp)
         app.block_commit_queue = OrderedCommitQueue()

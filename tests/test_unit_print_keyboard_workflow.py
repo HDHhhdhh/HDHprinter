@@ -173,12 +173,24 @@ class KeyboardWorkflowTests(unittest.TestCase):
         app.handle_workspace_tab(event(controls[0], "ISO_Left_Tab", 1))
         self.assertEqual(2, controls[1].focus_set.call_count)
 
-    def test_f6_refuses_to_discard_unsaved_editor(self):
+    def test_f6_saves_unsaved_editor_before_moving(self):
         app = self.app()
         entry = self.editor(app)
         app.handle_workspace_cycle(event(entry, "F6"))
+        app.replace_selected_block_from_editor.assert_called_once_with()
+        app.focus_builder_area.assert_called_once_with()
+        app.focus_queue_canvas.assert_not_called()
+        self.assertFalse(app.keyboard_state.editor_dirty)
+
+    def test_f6_stays_in_editor_when_save_fails(self):
+        app = self.app()
+        entry = self.editor(app)
+        app.replace_selected_block_from_editor.return_value = False
+        app.handle_workspace_cycle(event(entry, "F6"))
         app.focus_builder_area.assert_not_called()
         app.focus_queue_canvas.assert_not_called()
+        app.focus_queue_editor.assert_called_once_with()
+        self.assertTrue(app.keyboard_state.editor_dirty)
         self.assertIn("Esc", app.queue_status_var.get())
 
     def test_f6_and_shift_f6_cycle_queue_and_editor(self):

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "expected_ui_family": "Pretendard",
+  "upstream_version": "v1.3.9",
+  "license": "SIL Open Font License 1.1",
+  "license_path": "fonts/Pretendard/LICENSE.txt",
+  "license_sha256": "d31ddd9f2bed32fd7e302a205cf2380ba0de6529152d239ef99cfb6f261bfc04",
+  "license_source_url": "https://raw.githubusercontent.com/orioncactus/pretendard/v1.3.9/LICENSE",
+  "files": [
+    {
+      "relative_path": "fonts/Pretendard/Pretendard-Regular.ttf",
+      "filename": "Pretendard-Regular.ttf",
+      "size": 2725828,
+      "sha256": "6d0af5258997aec7354a6e340fc2325ba321c410ca48b3af858c8c3d6e92a324",
+      "family": "Pretendard",
+      "style": "Regular",
+      "version": "Version 1.309",
+      "source_url": "https://raw.githubusercontent.com/orioncactus/pretendard/v1.3.9/packages/pretendard/dist/public/static/alternative/Pretendard-Regular.ttf"
+    },
+    {
+      "relative_path": "fonts/Pretendard/Pretendard-Bold.ttf",
+      "filename": "Pretendard-Bold.ttf",
+      "size": 2661752,
+      "sha256": "c16b88c670d23e83fa1170c954cbc4822d3b8dad3c3cde15d798a94b43d97985",
+      "family": "Pretendard",
+      "style": "Bold",
+      "version": "Version 1.309",
+      "source_url": "https://raw.githubusercontent.com/orioncactus/pretendard/v1.3.9/packages/pretendard/dist/public/static/alternative/Pretendard-Bold.ttf"
+    },
+    {
+      "relative_path": "fonts/Pretendard/Pretendard-Medium.ttf",
+      "filename": "Pretendard-Medium.ttf",
+      "size": 2701192,
+      "sha256": "3bae579377eb8e9ac412cb4809ebc3de1d956ed75995c1e346f0c1311053f4e2",
+      "family": "Pretendard",
+      "style": "Medium",
+      "version": "Version 1.309",
+      "source_url": "https://raw.githubusercontent.com/orioncactus/pretendard/v1.3.9/packages/pretendard/dist/public/static/alternative/Pretendard-Medium.ttf"
+    },
+    {
+      "relative_path": "fonts/Pretendard/Pretendard-SemiBold.ttf",
+      "filename": "Pretendard-SemiBold.ttf",
+      "size": 2671468,
+      "sha256": "5e1c548732af70873103066c16e1369b9a8a871f0b38c321a1d5bc73e43cea2d",
+      "family": "Pretendard",
+      "style": "SemiBold",
+      "version": "Version 1.309",
+      "source_url": "https://raw.githubusercontent.com/orioncactus/pretendard/v1.3.9/packages/pretendard/dist/public/static/alternative/Pretendard-SemiBold.ttf"
+    }
+  ],
+  "reference_runtime": {
+    "python": "3.12.10",
+    "tk": "8.6.15",
+    "tk_scaling": 1.3333333333333333,
+    "screen_width": 1440,
+    "screen_height": 900,
+    "font_size": 11,
+    "normal_family": "Pretendard",
+    "bold_family": "Pretendard"
+  }
+}

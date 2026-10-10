@@ -200,10 +200,15 @@ function TestPython {
     $global:LASTEXITCODE = if ($env:TEST_PRINT_INSTALL_FAILURE -eq "environment") { 19 } else { 0 }
     return
   }
+  if ([string]$args[0] -like "*verify_quick_printer_fonts.py") {
+    Write-Output "boundary:fonts"
+    $global:LASTEXITCODE = if ($env:TEST_PRINT_INSTALL_FAILURE -eq "fonts") { 29 } else { 0 }
+    return
+  }
   throw "unexpected external Python operation"
 }
 function Write-Host {
-  if ([string]$args[0] -like "[[]3/9[]]*") {
+  if ([string]$args[0] -like "*SumatraPDF를 확인합니다.*") {
     Write-Output "boundary:verified-next-stage"
     throw "TEST STOP BEFORE APP INSTALL OPERATIONS"
   }
@@ -229,20 +234,31 @@ try {
         self.assertEqual(23, result.returncode, result.stdout + result.stderr)
         self.assertIn("boundary:pip", result.stdout)
         self.assertNotIn("boundary:environment", result.stdout)
+        self.assertNotIn("boundary:fonts", result.stdout)
         self.assertNotIn("boundary:verified-next-stage", result.stdout)
 
     def test_environment_mismatch_stops_before_installer_operations(self):
         result = self.run_installer("environment")
         self.assertEqual(23, result.returncode, result.stdout + result.stderr)
         self.assertIn("boundary:environment", result.stdout)
+        self.assertNotIn("boundary:fonts", result.stdout)
         self.assertNotIn("boundary:verified-next-stage", result.stdout)
 
-    def test_successful_pip_and_pins_are_required_before_next_stage(self):
+    def test_font_failure_stops_before_external_installer_operations(self):
+        result = self.run_installer("fonts")
+        self.assertEqual(23, result.returncode, result.stdout + result.stderr)
+        self.assertIn("boundary:environment", result.stdout)
+        self.assertIn("boundary:fonts", result.stdout)
+        self.assertIn("Pretendard 4", result.stdout)
+        self.assertNotIn("boundary:verified-next-stage", result.stdout)
+
+    def test_successful_pip_pins_and_fonts_are_required_before_next_stage(self):
         result = self.run_installer("none")
         self.assertEqual(23, result.returncode, result.stdout + result.stderr)
         self.assertIn("boundary:verified-next-stage", result.stdout)
         self.assertLess(result.stdout.index("boundary:pip"), result.stdout.index("boundary:environment"))
-        self.assertLess(result.stdout.index("boundary:environment"), result.stdout.index("boundary:verified-next-stage"))
+        self.assertLess(result.stdout.index("boundary:environment"), result.stdout.index("boundary:fonts"))
+        self.assertLess(result.stdout.index("boundary:fonts"), result.stdout.index("boundary:verified-next-stage"))
 
 
 if __name__ == "__main__":

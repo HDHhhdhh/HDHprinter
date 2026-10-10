@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+from unit_print_typography import korean_label
 
 
 class ToggleHoverCard:
@@ -39,16 +40,23 @@ class ToggleHoverCard:
 
         frame = tk.Frame(window, bg=self.background, padx=12, pady=9)
         frame.pack(padx=1, pady=1)
-        tk.Label(
+        korean_label(
             frame,
+            native=True,
+            responsive=False,
+            mode="balance",
             text=self.title,
             bg=self.background,
             fg=self.title_color,
             font=("Malgun Gothic", 9, "bold"),
             anchor="w",
+            justify="left",
+            wraplength=260,
         ).pack(fill="x")
-        tk.Label(
+        korean_label(
             frame,
+            native=True,
+            responsive=False,
             text=self.body,
             bg=self.background,
             fg=self.body_color,

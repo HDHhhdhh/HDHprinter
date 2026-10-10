@@ -35,6 +35,66 @@ _BLOCK_FIELDS = {
 _FILE_FIELDS = {"number", "name", "path", "printer_override", "pages_per_sheet"}
 
 
+def snapshot_print_block(block: Any) -> dict[str, Any]:
+    """Capture the exact PrintBlock DTO without deepcopying immutable PDF paths.
+
+    Keep field order and values equal to ``asdict(block)`` with paths converted
+    to strings and selected numbers converted to a list. No PDF is accessed.
+    """
+    return {
+        "subject": block.subject,
+        "level": block.level,
+        "round_name": block.round_name,
+        "start": block.start,
+        "end": block.end,
+        "copies": block.copies,
+        "files": [
+            {
+                "number": item.number,
+                "name": item.name,
+                "path": str(item.path),
+                "printer_override": item.printer_override,
+                "pages_per_sheet": item.pages_per_sheet,
+            }
+            for item in block.files
+        ],
+        "bundled": block.bundled,
+        "source": block.source,
+        "printer_override": block.printer_override,
+        "display_label": block.display_label,
+        "pages_per_sheet": block.pages_per_sheet,
+        "printer_route": block.printer_route,
+        "selected_numbers": list(block.selected_numbers) if block.selected_numbers is not None else None,
+        "name_separator_label": block.name_separator_label,
+        "material_kind": block.material_kind,
+        "history_id": block.history_id,
+        "order_id": block.order_id,
+        "material_id": block.material_id,
+        "replaces_block_id": block.replaces_block_id,
+    }
+
+
+def _detach_captured_snapshot(value: Any) -> Any:
+    """Copy JSON-shaped containers, leaving all schema checks to the writer.
+
+    Captured strings/numbers are immutable. Avoid the caller-side JSON encode,
+    decode and full schema walk while still owning every mutable container.
+    Unsupported Python objects are rejected rather than borrowed by reference.
+    """
+    kind = type(value)
+    if kind is dict:
+        if any(type(key) is not str for key in value):
+            raise RecoveryValidationError("자동 큐 스냅샷의 Python 필드 이름이 문자열이 아닙니다.")
+        return {key: _detach_captured_snapshot(item) for key, item in value.items()}
+    if kind is list:
+        return [_detach_captured_snapshot(item) for item in value]
+    if kind is tuple:
+        return tuple(_detach_captured_snapshot(item) for item in value)
+    if value is None or kind in (str, int, float, bool):
+        return value
+    raise RecoveryValidationError("자동 큐 스냅샷에 지원하지 않는 Python 값이 있습니다.")
+
+
 class RecoveryValidationError(ValueError):
     """The whole snapshot is rejected; callers must not salvage individual rows."""
 
@@ -86,8 +146,12 @@ def _string(value: Any, label: str, *, nonempty: bool = False, nullable: bool = 
         return
     if type(value) is not str or len(value) > 32_768 or "\x00" in value:
         raise RecoveryValidationError(f"{label}: 올바른 문자열이 아닙니다.")
-    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
-        raise RecoveryValidationError(f"{label}: 올바르지 않은 유니코드 문자가 있습니다.")
+    try:
+        # Strict UTF-8 rejects the same surrogate range in native code. Avoid
+        # a Python call per character across every field of a large queue.
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise RecoveryValidationError(f"{label}: 올바르지 않은 유니코드 문자가 있습니다.") from error
     if nonempty and not value.strip():
         raise RecoveryValidationError(f"{label}: 빈 문자열은 사용할 수 없습니다.")
 
@@ -259,6 +323,10 @@ class RecoveryStore:
     def save(self, payload: dict[str, Any]) -> bool:
         """Return False for an empty queue, preserving pre-crash candidates."""
         content = _encoded_snapshot(payload)
+        return self._save_encoded_snapshot(payload, content)
+
+    def _save_encoded_snapshot(self, payload: dict[str, Any], content: bytes) -> bool:
+        """Publish bytes already validated and encoded by this module."""
         if not payload["queue"]:
             return False
         path = self.directory / f"session-{payload['session_id']}.json"
@@ -426,7 +494,7 @@ class RecoveryWriter:
     def __init__(self, store: RecoveryStore) -> None:
         self.store = store
         self._condition = threading.Condition()
-        self._pending: tuple[int, dict[str, Any]] | None = None
+        self._pending: tuple[int, dict[str, Any], bytes | None] | None = None
         self._revision = 0
         self._processed = 0
         self._last_result_error: RecoveryWriteError | None = None
@@ -443,17 +511,35 @@ class RecoveryWriter:
             return self._running or self._pending is not None
 
     def submit(self, payload: dict[str, Any]) -> int:
-        snapshot = json.loads(_encoded_snapshot(payload))
+        content = _encoded_snapshot(payload)
+        snapshot = json.loads(content)
+        return self._enqueue_snapshot(snapshot, content)
+
+    def submit_captured(self, payload: dict[str, Any]) -> int:
+        """Detach an app capture now, fully validate it on the worker before I/O.
+
+        Unlike ``submit``, schema/size errors are reported by ``pop_error`` and
+        ``flush``. The unvalidated payload cannot create a directory, lease,
+        receipt or snapshot. Manual required saves retain synchronous checks.
+        """
+        try:
+            snapshot = _detach_captured_snapshot(payload)
+        except RecursionError as error:
+            raise RecoveryValidationError("자동 큐 스냅샷의 중첩이 너무 깊습니다.") from error
+        return self._enqueue_snapshot(snapshot, None)
+
+    def _enqueue_snapshot(self, snapshot: dict[str, Any], content: bytes | None) -> int:
         with self._condition:
             if self._closed:
                 raise RuntimeError("작업 큐 복구 저장기가 종료되었습니다.")
-            if not snapshot["queue"]:
-                return self._revision
-            if self._session_id is not None and snapshot["session_id"] != self._session_id:
-                raise ValueError("하나의 저장기는 한 실행 세션의 큐만 저장할 수 있습니다.")
-            self._session_id = snapshot["session_id"]
+            if content is not None:
+                if not snapshot["queue"]:
+                    return self._revision
+                if self._session_id is not None and snapshot["session_id"] != self._session_id:
+                    raise ValueError("하나의 저장기는 한 실행 세션의 큐만 저장할 수 있습니다.")
+                self._session_id = snapshot["session_id"]
             self._revision += 1
-            self._pending = (self._revision, snapshot)
+            self._pending = (self._revision, snapshot, content)
             if self._thread is None:
                 self._thread = threading.Thread(target=self._run, name="quick-print-recovery", daemon=True)
                 self._thread.start()
@@ -469,26 +555,40 @@ class RecoveryWriter:
                     self._condition.wait_for(lambda: self._pending is not None or self._closed)
                     if self._pending is None:
                         return
-                    revision, payload = self._pending
+                    revision, payload, content = self._pending
                     self._pending = None
                     self._running = True
                 error: RecoveryWriteError | None = None
                 try:
-                    if lease is None:
-                        self.store.directory.mkdir(parents=True, exist_ok=True)
-                        lease = self.store._lease_path(payload["session_id"]).open("a+b")
-                        try:
-                            _acquire_lease(lease)
-                        except OSError:
-                            lease.close()
-                            lease = None
-                            raise
+                    if content is None:
+                        content = _encoded_snapshot(payload)
+                    # The complete schema and byte limit must pass before even
+                    # acquiring a lease or publishing consumption evidence.
+                    if payload["queue"]:
                         with self._condition:
-                            self._lease_owned = True
-                    if not receipt_initialized:
-                        self.store._initialize_consumption_receipt(payload["session_id"])
-                        receipt_initialized = True
-                    self.store.save(payload)
+                            if self._session_id is not None and payload["session_id"] != self._session_id:
+                                raise ValueError("하나의 저장기는 한 실행 세션의 큐만 저장할 수 있습니다.")
+                            self._session_id = payload["session_id"]
+                        if lease is None:
+                            self.store.directory.mkdir(parents=True, exist_ok=True)
+                            lease = self.store._lease_path(payload["session_id"]).open("a+b")
+                            try:
+                                _acquire_lease(lease)
+                            except OSError:
+                                lease.close()
+                                lease = None
+                                raise
+                            with self._condition:
+                                self._lease_owned = True
+                        if not receipt_initialized:
+                            self.store._initialize_consumption_receipt(payload["session_id"])
+                            receipt_initialized = True
+                        if getattr(self.store.save, "__func__", None) is RecoveryStore.save:
+                            self.store._save_encoded_snapshot(payload, content)
+                        else:
+                            # Keep custom Store implementations and test gates
+                            # on the existing save override boundary.
+                            self.store.save(payload)
                 except Exception as caught:
                     error = caught if isinstance(caught, RecoveryWriteError) else RecoveryWriteError(f"작업 큐 복구 저장 실패: {caught}")
                 with self._condition:

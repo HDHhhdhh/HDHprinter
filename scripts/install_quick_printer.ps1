@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$SkipAssetSync)
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -65,11 +65,11 @@ if ((Test-Path -LiteralPath $venvPython) -and (-not (Test-PythonCommand $venvPyt
     throw "기존 .venv가 Python 3.12 환경이 아니거나 실행할 수 없습니다. 이 가상환경을 별도 보관한 뒤 Python 3.12로 .venv를 다시 만들고 설치를 실행해 주세요. 앱 자료와 설정은 지우지 마세요."
 }
 if (-not (Test-Path -LiteralPath $venvPython)) {
-    Write-Host "[1/9] Python 가상환경을 준비합니다."
+    Write-Host "[1/10] Python 가상환경을 준비합니다."
     New-AppVenv
 }
 
-Write-Host "[2/9] 앱 패키지를 설치합니다."
+Write-Host "[2/10] 앱 패키지를 설치합니다."
 & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $appRoot "unit_print_manager_requirements.txt")
 if ($LASTEXITCODE -ne 0) {
     throw "앱 패키지 설치에 실패했습니다. 네트워크와 Python 환경을 확인한 뒤 설치를 다시 실행해 주세요."
@@ -79,7 +79,13 @@ if ($LASTEXITCODE -ne 0) {
     throw "Python 3.12 및 패키지 버전 검증에 실패했습니다. 검증된 환경으로 복구한 뒤 설치를 다시 실행해 주세요."
 }
 
-Write-Host "[3/9] SumatraPDF를 확인합니다."
+Write-Host "[3/10] 배포 글꼴 설치를 확인합니다."
+& $venvPython (Join-Path $PSScriptRoot "verify_quick_printer_fonts.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "배포 글꼴 검증에 실패했습니다. fonts\README.md에 따라 Pretendard 4개 TTF를 Windows에 설치한 뒤 새 터미널에서 설치를 다시 실행해 주세요. 기존 글꼴과 버전이 충돌하면 임의로 삭제하거나 덮어쓰지 말고 안내된 차이를 확인하세요."
+}
+
+Write-Host "[4/10] SumatraPDF를 확인합니다."
 $sumatraCandidates = @(
     (Join-Path $env:LOCALAPPDATA "SumatraPDF\SumatraPDF.exe"),
     (Join-Path $env:ProgramFiles "SumatraPDF\SumatraPDF.exe"),
@@ -93,7 +99,7 @@ if (-not $sumatraCandidates) {
     & $winget.Source install --id SumatraPDF.SumatraPDF --exact --accept-package-agreements --accept-source-agreements --silent
 }
 
-Write-Host "[4/9] rclone을 확인합니다."
+Write-Host "[5/10] rclone을 확인합니다."
 $rclone = Find-RcloneExecutable
 if (-not $rclone) {
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -106,9 +112,11 @@ if (-not $rclone) {
     Write-Warning "rclone을 찾지 못했습니다. 앱 설치 후 새 자료 동기화는 수동으로 준비해야 합니다."
 }
 
-Write-Host "[5/9] 새 인쇄 자료를 확인합니다."
+Write-Host "[6/10] 새 인쇄 자료를 확인합니다."
 $assetConfig = Join-Path $appRoot "quick_printer_asset_channel.local.json"
-if ($rclone -and (Test-Path -LiteralPath $assetConfig)) {
+if ($SkipAssetSync) {
+    Write-Host "정본 설치 모드: 자료 동기화를 건너뛰고 ZIP에 포함된 자료를 검증합니다."
+} elseif ($rclone -and (Test-Path -LiteralPath $assetConfig)) {
     $assetChannel = Get-Content -LiteralPath $assetConfig -Raw | ConvertFrom-Json
     $remoteName = [string]$assetChannel.remote
     $configuredRemotes = @(& $rclone listremotes 2>$null)
@@ -124,13 +132,13 @@ if ($rclone -and (Test-Path -LiteralPath $assetConfig)) {
     }
 }
 
-Write-Host "[6/9] 앱 스냅샷과 배포 자료를 검증합니다."
+Write-Host "[7/10] 앱 스냅샷과 배포 자료를 검증합니다."
 & $venvPython (Join-Path $PSScriptRoot "verify_quick_printer_release.py") --root $appRoot --fast
 if ($LASTEXITCODE -ne 0) {
     throw "배포 자료 검증에 실패했습니다."
 }
 
-Write-Host "[7/9] Python 소스를 컴파일합니다."
+Write-Host "[8/10] Python 소스를 컴파일합니다."
 & $venvPython -m py_compile `
     (Join-Path $appRoot "unit_print_bootstrap.py") `
     (Join-Path $appRoot "unit_print_instance.py") `
@@ -148,13 +156,13 @@ if ($LASTEXITCODE -ne 0) {
     throw "Python 소스 컴파일 검사에 실패했습니다."
 }
 
-Write-Host "[8/9] 앱 단위 테스트를 실행합니다."
+Write-Host "[9/10] 앱 단위 테스트를 실행합니다."
 & $venvPython -m unittest discover -s (Join-Path $appRoot "tests") -p "test_unit_print*.py"
 if ($LASTEXITCODE -ne 0) {
     throw "앱 단위 테스트에 실패했습니다."
 }
 
-Write-Host "[9/9] 바로가기를 만듭니다."
+Write-Host "[10/10] 바로가기를 만듭니다."
 $shell = New-Object -ComObject WScript.Shell
 $launcher = Join-Path $appRoot "run_unit_print_manager_hidden.vbs"
 $icon = Join-Path $appRoot "output\unit_print_manager\quick_print_icon.ico"

@@ -53,6 +53,8 @@ class ReleaseManifestTests(unittest.TestCase):
             "unit_print_history_events.py",
             "unit_print_progress.py",
             "unit_print_preparation.py",
+            "unit_print_source_paths.py",
+            "unit_print_typography.py",
         ):
             self.assertIn(name, APP_FILES)
             self.assertTrue((PROJECT_ROOT / name).is_file())

@@ -36,6 +36,9 @@ def make_app(blocks):
     app = PrintManagerApp.__new__(PrintManagerApp)
     app.blocks = blocks
     app.root = Mock()
+    # Existing domain fixtures run the same preparation/result/commit path
+    # immediately. Async UI behavior is covered by the event-loop fixture.
+    app._launch_print_preparation = lambda work: work()
     app.is_printing = False
     app.retry_batch = None
     app.block_status_by_id = {}

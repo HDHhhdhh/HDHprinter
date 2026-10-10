@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
 
@@ -426,6 +429,62 @@ class TextbookCatalogTests(unittest.TestCase):
 
         self.assertIsNone(catalog.find_edition("공수1", "동아출판"))
         self.assertIn("안전하지 않은", catalog.issues[0])
+
+    def test_catalog_resolves_root_once_and_every_asset_independently(self) -> None:
+        expected = load_textbook_catalog(TEXTBOOK_CATALOG_PATH, self.root)
+        resolved_paths: list[Path] = []
+        original_resolve = Path.resolve
+
+        def resolve(path: Path, *args, **kwargs) -> Path:
+            resolved_paths.append(path)
+            return original_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", resolve):
+            actual = load_textbook_catalog(TEXTBOOK_CATALOG_PATH, self.root)
+
+        asset_paths = [
+            self.root / asset.relative_path
+            for subject in actual.subjects
+            for edition in subject.editions
+            for asset in (edition.problem, edition.solution, edition.core, edition.variant)
+            if asset is not None
+        ]
+        self.assertEqual(expected, actual)
+        self.assertEqual(141, len(asset_paths))
+        self.assertCountEqual([self.root, *asset_paths], resolved_paths)
+
+    def test_catalog_rejects_directory_link_to_pdf_outside_root(self) -> None:
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        write_pdf(outside / "problem.pdf")
+        link = self.root / "linked"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            if os.name != "nt" or error.winerror != 1314:
+                self.skipTest(f"Directory symlinks are unavailable: {error}")
+            # A junction exercises real Windows path resolution without
+            # requiring the symlink privilege. Both paths stay in this fixture.
+            result = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(outside)],
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0 or not link.is_junction():
+                self.skipTest("Directory links are unavailable in this environment")
+        write_catalog(
+            self.catalog_path,
+            self.root,
+            status="pending",
+            problem_path="linked/problem.pdf",
+        )
+
+        catalog = self.load()
+
+        self.assertIsNone(catalog.find_edition("공수1", "동아출판"))
+        self.assertEqual(1, len(catalog.issues))
+        self.assertIn("자료 루트 밖", catalog.issues[0])
 
     def test_asset_verification_checks_size_pages_and_hash(self) -> None:
         write_catalog(

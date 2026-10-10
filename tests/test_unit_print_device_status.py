@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import threading
 import unittest
 from pathlib import Path
@@ -249,6 +250,91 @@ class _ScriptedCanonClient(CanonStatusClient):
         self.login_calls += 1
         self._authenticated = True
         self._job_monitor_initialized = False
+
+
+class CassetteLoadingSnapshotTests(unittest.TestCase):
+    def snapshot(self, codes="0x1180102", status="32", levels=("0", "3"),
+                 sizes=("A4", "A4"), visible="", active=False):
+        sources = {
+            str(number): {"cstName": f"카세트 {number}", "pSizeName": size,
+                          "remainPapVol": level, "totalPapVol": "3"}
+            for number, (level, size) in enumerate(zip(levels, sizes), 1)
+        }
+        portal = (visible + '<script>'
+                  + (f'var prt_status = "{status}";' if status is not None else '')
+                  + f'var errCodeTbl = new Array({codes});'
+                  + f'var cstInfo = {json.dumps(sources, ensure_ascii=False)};'
+                  + 'var tonerVolInfo = {"tonerKVol":"50"};</script>')
+        active_html = '''<table>
+          <tr><th>파일명</th><th>상황</th></tr>
+          <tr><td>QP_ABCDEF1234567890_test.pdf</td><td>인쇄 중</td></tr>
+        </table>''' if active else '<table></table>'
+        client = _ScriptedCanonClient({"portal": portal, "/sysmonitor": "ok",
+                                       "active_jobs": active_html, "job_log": '<table></table>'})
+        snapshot = client.read_snapshot()
+        self.assertNotIn("supplies", client.calls)
+        return snapshot
+
+    def test_either_verified_drawer_can_be_open_without_stopping_other_a4_feed(self):
+        for code, levels, number in (("0x1180102", ("0", "3"), 1),
+                                      ('"0X01180202"', ("3", "0"), 2)):
+            with self.subTest(drawer=number):
+                snapshot = self.snapshot(codes=code, levels=levels)
+                self.assertTrue(snapshot.can_dispatch)
+                self.assertEqual(DeviceHealth.READY, snapshot.health)
+                self.assertEqual((), snapshot.errors)
+                self.assertIn(f"카세트 {number} 용지 보충 중", snapshot.status_text)
+                self.assertNotIn("비어 있음", snapshot.status_text)
+                self.assertIn("용지 보충 중", build_device_status_view(snapshot).headline)
+
+    def test_printing_bit_and_active_jobs_preserve_busy_status(self):
+        for status, active in (("33", False), ("32", True)):
+            with self.subTest(status=status, active=active):
+                snapshot = self.snapshot(status=status, active=active)
+                self.assertEqual(DeviceHealth.BUSY, snapshot.health)
+                self.assertTrue(snapshot.can_dispatch)
+                self.assertIn("인쇄 중", snapshot.status_text)
+
+    def test_no_confirmed_closed_a4_source_holds_without_claiming_paper_empty(self):
+        for levels, sizes in ((("0", "0"), ("A4", "A4")),
+                              (("0", "unknown"), ("A4", "A4")),
+                              (("0", "3"), ("A4", "B4")),
+                              (("3", "0"), ("A4", "A4"))):
+            with self.subTest(levels=levels, sizes=sizes):
+                snapshot = self.snapshot(levels=levels, sizes=sizes)
+                self.assertEqual(DeviceHealth.HELD, snapshot.health)
+                self.assertFalse(snapshot.can_dispatch)
+                self.assertIn("용지 보충 중", snapshot.status_text)
+                self.assertNotIn("용지 없음", snapshot.status_text)
+
+    def test_both_open_drawers_are_not_available_even_with_stale_positive_sensors(self):
+        snapshot = self.snapshot(codes="0x1180102, 0x1180202", levels=("3", "3"))
+        self.assertEqual(DeviceHealth.HELD, snapshot.health)
+        self.assertFalse(snapshot.can_dispatch)
+
+    def test_mixed_unknown_and_other_fault_codes_stay_blocking(self):
+        for code in ('"E000123"', '0x0103101B', '0x1180302', '0x1060202', '0xDEADBEEF'):
+            with self.subTest(code=code):
+                snapshot = self.snapshot(codes="0x1180102, " + code)
+                self.assertEqual(DeviceHealth.ERROR, snapshot.health)
+                self.assertFalse(snapshot.can_dispatch)
+
+    def test_missing_reserved_and_hard_status_bits_stay_blocking(self):
+        for status in (None, "0", "36", "160", "96", "48"):
+            with self.subTest(status=status):
+                self.assertFalse(self.snapshot(status=status).can_dispatch)
+
+    def test_visible_jam_staple_and_cover_faults_override_loading(self):
+        for text in ("용지 걸림", "스테이플 없음", "커버를 닫으십시오.", "토너를 교환하십시오."):
+            with self.subTest(text=text):
+                snapshot = self.snapshot(visible=f"<p>{text}</p>")
+                self.assertEqual(DeviceHealth.ERROR, snapshot.health)
+                self.assertFalse(snapshot.can_dispatch)
+
+    def test_closed_drawer_returns_to_normal_status_without_loading_notice(self):
+        snapshot = self.snapshot(codes="null", status="0", levels=("3", "3"))
+        self.assertTrue(snapshot.can_dispatch)
+        self.assertEqual("인쇄 가능", snapshot.status_text)
 
 
 class CanonStatusClientTests(unittest.TestCase):

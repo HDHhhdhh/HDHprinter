@@ -20,7 +20,7 @@ from pypdf import PdfWriter
 from unit_print_history import HistoryWriteError, PrintHistory, read_history
 from unit_print_keyboard import KeyboardState
 from unit_print_manager import ExamPdf, PrintBlock, PrintManagerApp
-from unit_print_queue_recovery import RecoveryStore, RecoveryWriteError, RecoveryWriter
+from unit_print_queue_recovery import RecoveryStore, RecoveryWriteError, RecoveryWriter, snapshot_print_block
 from unit_print_recovery_history import RecoveryHistoryReview, classify_recovery_queue
 
 
@@ -401,12 +401,50 @@ class RecoveryWorkflowTests(unittest.TestCase):
         app.keyboard_state.enter_queue(cursor=0)
         app.queue_recovery_writer = Mock()
         app.update_queue_view(select_index=0)
-        app.queue_recovery_writer.submit.assert_called_once()
-        first = app.queue_recovery_writer.submit.call_args.args[0]
+        app.queue_recovery_writer.submit_captured.assert_called_once()
+        app.queue_recovery_writer.submit.assert_not_called()
+        first = app.queue_recovery_writer.submit_captured.call_args.args[0]
         self.assertEqual("ORDER-7", first["queue"][0]["block"]["order_id"])
         app.queue_recovery_writer.reset_mock()
         app.refresh_queue_selection(select_index=1)
-        app.queue_recovery_writer.submit.assert_not_called()
+        app.queue_recovery_writer.submit_captured.assert_not_called()
+
+    def test_production_block_capture_matches_legacy_format_and_is_detached(self) -> None:
+        blocks = self.blocks()
+        app = self.app(blocks)
+        for index, block in enumerate(blocks):
+            app.block_status_by_id[id(block)] = ("대기", "예약", "진행 중")[index]
+            app.block_detail_by_id[id(block)] = f"synthetic detail {index}"
+        captured = app.queue_recovery_snapshot("queue_changed")
+        for original, entry in zip(blocks, captured["queue"]):
+            legacy = asdict(original)
+            for item in legacy["files"]:
+                item["path"] = str(item["path"])
+            if legacy["selected_numbers"] is not None:
+                legacy["selected_numbers"] = list(legacy["selected_numbers"])
+            self.assertEqual(legacy, entry["block"])
+            self.assertEqual(list(legacy), list(entry["block"]), "serialized field order changed")
+            self.assertEqual(snapshot_print_block(original), entry["block"])
+        before = copy.deepcopy(captured)
+        blocks[0].copies = 99
+        blocks[0].selected_numbers = (1, 2, 3)
+        blocks[0].files.append(ExamPdf(10, "later", self.pdf))
+        blocks[1].history_id = "changed-id"
+        blocks[1].name_separator_label = "changed-name"
+        app.block_status_by_id[id(blocks[2])] = "완료"
+        self.assertEqual(before, captured)
+        self.assertEqual(["unsent", "unsent", "uncertain"], [entry["risk"] for entry in captured["queue"]])
+
+    def test_automatic_production_capture_uses_fast_path_and_remains_exact(self) -> None:
+        app = self.app(self.blocks())
+        expected_blocks = [snapshot_print_block(block) for block in app.blocks]
+        with patch.object(app.queue_recovery_writer, "submit", side_effect=AssertionError("automatic save used synchronous validation")):
+            app.schedule_queue_recovery_save()
+            app.queue_recovery_writer.flush(timeout=2)
+        saved = self.store.load()
+        self.assertEqual(expected_blocks, [entry["block"] for entry in saved["queue"]])
+        self.assertEqual("queue_changed", saved["reason"])
+        self.assertEqual(app.print_history.session_id, saved["session_id"])
 
     def test_close_stores_final_queue_before_session_close_evidence_and_destroy(self) -> None:
         app = self.app(self.blocks())

@@ -69,6 +69,23 @@ class ResourceEstimateTests(unittest.TestCase):
 
         self.assertEqual(1, estimate.staple_sets)
 
+    def test_bulk_copies_keep_paper_counts_without_adding_300_setup_delays(self) -> None:
+        estimate = estimate_print_resources(
+            (ResourceJob(None, copies=300, known_page_count=2),),
+            page_counter=lambda _path: 0,
+            duplex=True,
+        )
+        bundled = estimate_print_resources(
+            (ResourceJob(None, copies=300, known_page_count=2, dispatch_jobs=300),),
+            page_counter=lambda _path: 0,
+            duplex=True,
+        )
+        self.assertEqual(300, estimate.total_sheets)
+        self.assertEqual(300, estimate.output_sets)
+        self.assertEqual(0, estimate.staple_sets)
+        self.assertLess(estimate.eta.seconds_expected, 10 * 60)
+        self.assertGreater(bundled.eta.seconds_expected - estimate.eta.seconds_expected, 2000)
+
     def test_readiness_uses_lower_band_for_sufficient_and_upper_for_shortage(self) -> None:
         capacity = estimate_a4_capacity(
             DeviceConsumables(

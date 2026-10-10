@@ -45,15 +45,20 @@ from unit_print_textbooks import (  # noqa: E402
     load_textbook_catalog,
     verify_textbook_asset,
 )
+from scripts.verify_quick_printer_fonts import verify_bundled_fonts  # noqa: E402
 
 
 APP_FILES = (
     "unit_print_bootstrap.py",
     "unit_print_instance.py",
     "unit_print_manager.py",
+    "unit_print_theme.py",
+    "unit_print_typography.py",
+    "unit_print_preview.py",
     "unit_print_domain.py",
     "unit_print_execution.py",
     "unit_print_paths.py",
+    "unit_print_source_paths.py",
     "unit_print_keyboard.py",
     "unit_print_text_shortcuts.py",
     "unit_print_gyopyeong.py",
@@ -95,6 +100,7 @@ APP_FILES = (
     "unit_print_catalog.json",
     "unit_print_manager_requirements.txt",
     "unit_print_manager_README.md",
+    "빠른인쇄기_GUI_디자인_참고.md",
     "빠른인쇄기_키보드_사용가이드.md",
     "빠른인쇄기_대량주문서_양식.csv",
     "빠른인쇄기_대량주문서_가이드.md",
@@ -116,6 +122,7 @@ APP_FILES = (
     "scripts/setup_quick_printer_profiles.py",
     "scripts/verify_quick_printer_release.py",
     "scripts/verify_quick_printer_environment.py",
+    "scripts/verify_quick_printer_fonts.py",
     "scripts/benchmark_quick_printer_preparation.py",
     "scripts/build_quick_printer_release.py",
     "scripts/quick_printer_asset_sync.py",
@@ -129,6 +136,13 @@ APP_FILES = (
     "scripts/verify_quick_printer_server_integration.py",
     "quick_printer_asset_channel.example.json",
     "quick_printer_local_paths.example.json",
+    "fonts/README.md",
+    "fonts/quick_printer_fonts.json",
+    "fonts/Pretendard/LICENSE.txt",
+    "fonts/Pretendard/Pretendard-Regular.ttf",
+    "fonts/Pretendard/Pretendard-Bold.ttf",
+    "fonts/Pretendard/Pretendard-Medium.ttf",
+    "fonts/Pretendard/Pretendard-SemiBold.ttf",
     "sync_quick_printer_assets.cmd",
     "빠른인쇄기_제품동작_정본.md",
     "output/unit_print_manager/quick_print_icon.ico",
@@ -207,6 +221,10 @@ def parse_args() -> argparse.Namespace:
         "--drive-folder-url",
         required=True,
         help="Google Drive folder URL written to the external Codex handoff guide.",
+    )
+    parser.add_argument(
+        "--asset-drive-folder-url",
+        help="Optional PDF-update channel; defaults to --drive-folder-url for compatibility.",
     )
     return parser.parse_args()
 
@@ -566,6 +584,23 @@ def write_portable_apex_cache(destination: Path, apex_records: list[PdfSource]) 
     return len(portable)
 
 
+def font_install_instructions() -> str:
+    return """### 정본 글꼴 설치와 확인
+
+- 앱을 실행하기 전에 `fonts/README.md`를 읽고 `fonts/Pretendard`의 Regular/Bold/Medium/SemiBold **네 TTF 파일만** Windows에 설치합니다. 모두 제작 PC와 같은 Pretendard v1.3.9(`Version 1.309`) 원본입니다. 다른 굵기, Variable, OTF 또는 최신 버전을 추가하지 않습니다.
+- Windows에서 이 네 파일을 선택해 우클릭 `설치`를 실행합니다. 현재 런타임에 네이티브 조작이 없으면 사용자가 설치 단계만 직접 수행합니다. 지원되지 않는 조작 경로로 우회하지 않습니다. [Microsoft 설치 절차](https://support.microsoft.com/en-us/windows/experience/personalization/manage-fonts-in-windows)를 따릅니다.
+- 앱이 열려 있으면 닫습니다. 앱 가상환경이 이미 있으면 설치 후 새 프로세스로 아래 명령을 실행합니다. 새 PC에 `.venv`가 없으면 다음 앱 설치 명령이 Python 환경을 준비한 뒤 같은 글꼴 검사를 자동 실행합니다. 배포/설치 글꼴 SHA-256과 앱의 실제 family 선택을 확인하며, 글꼴을 설치하거나 프린터를 호출하지 않습니다.
+
+```powershell
+& ".venv\\Scripts\\python.exe" "scripts\\verify_quick_printer_fonts.py"
+```
+
+- `issues`가 빈 목록이고 `ui_font_family`와 normal/bold 실제 family가 모두 `Pretendard`여야 합니다. 기존 같은 이름 글꼴의 해시가 다르면 자동 덮어쓰기·삭제하지 말고 먼저 버전을 확인합니다.
+- 파일별 크기/해시와 제작 환경은 `fonts/quick_printer_fonts.json`에 있습니다. OFL 1.1 저작권과 라이선스는 `fonts/Pretendard/LICENSE.txt`에 포함합니다. Windows 맑은 고딕/Yu Gothic 또는 윤고딕 파일은 번들에 없습니다. [Windows 글꼴 재배포 규칙](https://learn.microsoft.com/en-us/typography/fonts/font-faq)을 따릅니다.
+- 글꼴 검사 통과는 픽셀 동일성 판정이 아닙니다. 기준 GUI 자료가 있으면 Python/Tk·DPI·배율·화면/창 크기까지 맞춰 비교합니다.
+"""
+
+
 def write_release_docs(
     destination: Path,
     counts: dict[str, int],
@@ -595,26 +630,29 @@ def write_release_docs(
 - 앱을 닫았다 다시 열면 작업 큐는 비어 있고 모든 부수는 1로 시작합니다. 실제 인쇄는 항상 흑백·A4·양면이며, 세로/가로/A:ble/구분지 전용 큐로 분기합니다.
 - `reference_gui`는 제작 PC에서 실행한 무인쇄 GUI 기준 자료입니다. 새 PC에서는 기능을 다시 디자인하지 말고 이 구조와 비교합니다.
 
+{font_install_instructions()}
+
 ## 설치
 
 1. ZIP을 원하는 고정 폴더에 완전히 압축 해제합니다. 권장 위치는 `D:\\빠른 인쇄기`입니다.
-2. `install_quick_printer.cmd`를 실행합니다. Python 3.11 이상이 없으면 Python 3.12를, SumatraPDF가 없으면 SumatraPDF를 `winget`으로 설치합니다. 이어서 앱 가상환경, 필수 패키지, 바탕화면/시작 메뉴 바로가기를 준비합니다.
-3. 설치 후 바탕화면의 `빠른 인쇄기`를 실행합니다.
-4. 기본 프린터 `iR-ADV 8585 III`가 Windows에 설치되어 있어야 합니다.
-5. 관리자 PowerShell에서 아래 명령을 실행해 전용 큐 4개를 만듭니다.
+2. 위 정본 글꼴 안내에 따라 `fonts/Pretendard`의 네 TTF 파일을 먼저 Windows에 설치합니다.
+3. 앱 폴더에서 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install_quick_printer.ps1 -SkipAssetSync`를 실행합니다. Python 3.12와 SumatraPDF가 없으면 `winget`으로 설치합니다. 앱 가상환경, 필수 패키지와 바로가기를 준비하며, 정본 설치 중 PDF 증분 동기화는 실행하지 않습니다.
+4. 설치와 글꼴 검사를 완료한 뒤 바탕화면의 `빠른 인쇄기`를 실행합니다.
+5. 기본 프린터 `iR-ADV 8585 III`가 Windows에 설치되어 있어야 합니다.
+6. 관리자 PowerShell에서 아래 명령을 실행해 전용 큐 4개를 만듭니다.
 
 ```powershell
 & ".venv\\Scripts\\python.exe" "scripts\\setup_quick_printer_profiles.py" --base-printer "iR-ADV 8585 III"
 ```
 
-6. 다음 큐가 모두 있어야 합니다.
+7. 다음 큐가 모두 있어야 합니다.
    - `iR-ADV 8585 III - 세로`: A4, 흑백, 세로, 양면 긴 쪽 넘김, 좌측 상단 스테이플
    - `iR-ADV 8585 III - 가로`: A4, 흑백, 가로, 양면 짧은 쪽 넘김, 좌측 상단 스테이플
    - `iR-ADV 8585 III - 구분지`: A4, 흑백, 가로, 스테이플 없음
    - `iR-ADV 8585 III -A:ble`: A4, 흑백, 가로, 양면 짧은 쪽 넘김, 좌측 상단 스테이플. 드라이버 모아찍기는 1쪽이며 앱이 2×2 PDF를 만듭니다.
 
-7. `빠른인쇄기_프린터_ComputerUse_설정검증.md`를 새 PC의 Codex에 전달합니다. Codex는 Computer Use로 Canon 드라이버 화면을 직접 확인하고 기본 큐와 전용 큐 4개를 각각 설정합니다.
-8. 인증값은 Canon 인증 창에서 사용자가 직접 입력합니다.
+8. `빠른인쇄기_프린터_ComputerUse_설정검증.md`를 새 PC의 Codex에 전달합니다. Codex는 Computer Use로 Canon 드라이버 화면을 직접 확인하고 기본 큐와 전용 큐 4개를 각각 설정합니다.
+9. 인증값은 Canon 인증 창에서 사용자가 직접 입력합니다.
    - 부서 ID: `{department_id}`
    - PIN/PW: `{department_pin}`
    - `PIN 설정 허가`: 켬
@@ -647,8 +685,9 @@ winget install --id SumatraPDF.SumatraPDF --exact --accept-package-agreements --
 
 ## 이후 인쇄 자료만 업데이트
 
-- 최초 ZIP은 전체 PDF 기준본입니다. 이후에는 `sync_quick_printer_assets.cmd`가 Drive 매니페스트와 로컬 파일을 비교해 새 PDF와 변경 PDF만 내려받습니다.
-- 설치 스크립트는 rclone을 준비하고, 이 PC에 `gdrive:` 인증이 이미 있으면 증분 동기화도 실행합니다.
+- 최초 ZIP은 전체 PDF 기준본입니다. 정본 설치는 `-SkipAssetSync`로 수행한 뒤 `scripts/verify_quick_printer_release.py`로 전체 SHA-256을 확인합니다. 설치 중에는 업데이트 채널로 기준본을 바꾸지 않습니다.
+- 이후에는 `sync_quick_printer_assets.cmd`가 `quick_printer_asset_channel.local.json`의 별도 PDF 업데이트 채널을 사용해 새 PDF와 변경 PDF만 내려받습니다. ZIP 다운로드 채널과 목적이 다릅니다.
+- 기본 설치 스크립트는 rclone을 준비하고 인증이 있으면 동기화할 수 있습니다. 이번 정본 설치에서는 반드시 `-SkipAssetSync`를 사용합니다.
 - `gdrive:`가 없으면 PowerShell에서 `rclone config`를 실행해 Google Drive 로그인을 한 번 완료한 뒤 `sync_quick_printer_assets.cmd`를 실행합니다.
 - 동기화는 원격 또는 로컬의 여분 파일을 자동 삭제하지 않습니다. 기준본 파일이 빠졌다면 전체 ZIP에서 먼저 복원합니다.
 
@@ -671,7 +710,8 @@ winget install --id SumatraPDF.SumatraPDF --exact --accept-package-agreements --
 - 먼저 `빠른인쇄기_설치_가이드.md`, `빠른인쇄기_프린터_ComputerUse_설정검증.md`, `release_manifest.json`을 읽는다.
 - `scripts/verify_quick_printer_release.py --fast`가 실패하면 소스를 수정해 맞추지 말고 ZIP을 다시 압축 해제한다.
 - 앱 자료 경로는 이 폴더의 `data` 아래를 자동 감지하므로 절대경로로 다시 고정하지 않는다.
-- `install_quick_printer.cmd`를 실행하고 검증 스크립트와 단위 테스트를 통과시킨다.
+- 정본 설치는 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install_quick_printer.ps1 -SkipAssetSync`로 수행하고 전체 SHA-256 검증과 단위 테스트를 통과시킨다. PDF 업데이트 채널은 설치 후 증분 업데이트용이다.
+- `fonts/README.md`의 정본 Pretendard 네 TTF만 설치하고 `scripts/verify_quick_printer_fonts.py`를 통과시킨다. 글꼴이 없으면 다른 family로 대체해 동일환경 합격으로 처리하지 않는다.
 - 프린터 설정은 PowerShell 결과만으로 합격 처리하지 않는다. Computer Use로 Canon GUI의 현재 사용자 기본값과 시스템 인쇄 기본값을 모두 확인한다.
 - 인증 창은 자동 조작하지 않는다. 사용자가 ID/PIN을 직접 입력하도록 제어권을 넘기고, 저장 뒤 무팝업 인쇄를 확인한다.
 - 부서 ID/PIN을 코드, JSON, 스크린샷, 일반 로그에 기록하지 않는다.
@@ -696,6 +736,7 @@ def write_codex_handoff(
     drive_folder_url: str,
     department_id: str,
     department_pin: str,
+    asset_drive_folder_url: str | None = None,
 ) -> None:
     category_lines = "\n".join(f"- {name}: {count:,}개" for name, count in counts.items())
     guide = f"""# 빠른 인쇄기 동일환경 설치 지시서
@@ -709,6 +750,7 @@ def write_codex_handoff(
 ## 정본 배포 파일
 
 - Google Drive 폴더: {drive_folder_url}
+- 이후 PDF 증분 업데이트 채널: {asset_drive_folder_url or drive_folder_url}
 - ZIP 파일명: `{archive_name}`
 - 체크섬 파일명: `{checksum_name}`
 - 압축 해제 후 최상위 폴더: `{release_name}`
@@ -752,8 +794,12 @@ if ($actual -ne $expected) {{ throw "ZIP SHA-256 불일치: 다시 다운로드�
 
 1. ZIP을 완전히 압축 해제한다. 권장 고정 위치는 `D:\\빠른 인쇄기`다.
 2. ZIP 안의 `{release_name}` 폴더 내용을 고정 위치에 둔다.
-3. `install_quick_printer.cmd`를 실행한다.
-4. 설치 스크립트가 Python 3.11+ 가상환경, 고정 버전 Python 패키지, SumatraPDF, 바로가기를 준비하고 앱 파일·PDF·테스트를 검증하도록 끝까지 기다린다.
+
+{font_install_instructions()}
+
+3. 앱 폴더에서 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\install_quick_printer.ps1 -SkipAssetSync`를 실행한다.
+4. 설치 스크립트가 Python 3.12 가상환경, 고정 버전 Python 패키지, SumatraPDF, 바로가기를 준비하고 앱 파일·PDF·테스트를 검증하도록 끝까지 기다린다. 이번 설치는 PDF 업데이트 동기화를 건너뛴다.
+5. 설치 뒤 아래 전체 SHA-256 검사를 통과시킨다. ZIP 다운로드 폴더는 정본 수신용이며 `quick_printer_asset_channel.local.json`의 채널은 이후 PDF 증분 업데이트용이다. 설치 중에는 업데이트를 실행하지 않는다.
 
 Python 또는 SumatraPDF 자동 설치가 막히면 관리자 PowerShell에서 먼저 실행한다.
 
@@ -816,6 +862,7 @@ Computer Use로 **현재 사용자 인쇄 기본 설정과 프린터 속성 > �
 
 - ZIP과 추출 파일의 해시 검증 성공
 - 모든 단위 테스트 성공
+- 정본 글꼴 네 파일의 설치 해시와 실제 Tk family 검사 성공
 - 등록 PDF 누락·추가 파일 없음
 - 앱 시작 시 작업 큐가 비어 있고 부수는 1
 - 바탕화면과 작업표시줄 아이콘 일치
@@ -852,13 +899,17 @@ def main() -> int:
     if archive_path.exists():
         raise FileExistsError(f"Archive already exists: {archive_path}")
 
+    _font_manifest, font_issues = verify_bundled_fonts(PROJECT_ROOT)
+    if font_issues:
+        raise ValueError("Release font verification failed: " + "; ".join(font_issues))
     config = load_json(PROJECT_ROOT / "unit_print_manager_config.json")
     records = collect_registered_pdfs(config)
     destination.mkdir(parents=True)
     copy_app_files(destination, args.reference_gui)
     render_private_release_templates(destination, args.department_id, args.department_pin)
     write_portable_config(destination)
-    write_portable_asset_channel(destination, args.drive_folder_url)
+    asset_drive_folder_url = args.asset_drive_folder_url or args.drive_folder_url
+    write_portable_asset_channel(destination, asset_drive_folder_url)
 
     manifest_entries: list[PdfManifestEntry] = []
     counts: dict[str, int] = {}
@@ -920,6 +971,7 @@ def main() -> int:
         drive_folder_url=args.drive_folder_url,
         department_id=args.department_id,
         department_pin=args.department_pin,
+        asset_drive_folder_url=asset_drive_folder_url,
     )
     result = {
         "release_dir": str(destination),

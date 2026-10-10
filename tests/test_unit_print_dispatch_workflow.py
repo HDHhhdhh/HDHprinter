@@ -181,6 +181,148 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertTrue(all(self.app.queue_block_status(block) == "완료" for block in self.blocks))
         self.assertIsNone(self.app.retry_batch)
 
+    def test_completion_clock_receives_exact_unfinished_work_from_real_rolling_worker(self):
+        self.monitor.completion_batch_size = 1
+        observations = []
+        original = self.app.update_print_resource_eta
+
+        def record(observation):
+            observations.append(observation)
+            original(observation)
+
+        self.app.update_print_resource_eta = record
+        records = self.run_worker()
+        self.assertEqual([4, 3, 2, 1, 0], [len(item.remaining_job_ids) for item in observations])
+        self.assertEqual([4, 3, 2, 1, 0], [item.remaining_sheets for item in observations])
+        self.assertTrue(all(item.complete for item in observations))
+        self.assertTrue(all(item.run_id == records[0]["run_id"] for item in observations))
+        self.assertTrue(any("예상 완료 시간" in call.args[0]
+                            for call in self.app.set_current_work.call_args_list))
+        self.assertEqual("device_jobs_completed", records[-1]["outcome"])
+
+    def test_first_eta_deducts_bulk_printing_during_second_pdf_preparation(self):
+        from unit_print_eta import EtaWorkload, estimate_workloads_seconds
+        self.blocks[0].copies = 300
+        self.jobs = tuple(self.app.initialize_active_print_queue(self.blocks, False))
+        origin = datetime.now().astimezone()
+        elapsed = [0.0]
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = origin + timedelta(seconds=elapsed[0])
+                return value.astimezone(tz) if tz is not None else value
+
+        real_send = self.monitor.send
+
+        def delayed_second_pdf(*args, **kwargs):
+            result = real_send(*args, **kwargs)
+            if len(self.monitor.sent_tokens) == 2:
+                elapsed[0] = 90
+                first = replace(self.monitor.job(self.monitor.sent_tokens[0], DeviceJobState.PRINTING), started_at=origin)
+                self.monitor._snapshot = replace(self.monitor._snapshot, observed_at=Clock.now(), active_jobs=(first,))
+            return result
+
+        self.enqueue.side_effect = delayed_second_pdf
+        observations = []
+        real_observe = self.app.update_print_resource_eta
+
+        def observe(value):
+            observations.append(value)
+            real_observe(value)
+
+        self.app.update_print_resource_eta = observe
+        with patch("unit_print_execution.time.monotonic", side_effect=lambda: elapsed[0]), patch("unit_print_execution.datetime", Clock):
+            self.run_worker()
+        full = estimate_workloads_seconds((EtaWorkload(300, 300),) + (EtaWorkload(1),) * 3)
+        self.assertEqual(full.seconds_expected - 90, observations[0].eta.seconds_expected)
+        self.assertEqual(303, observations[0].remaining_sheets)
+
+    def install_device_timestamps(self):
+        origin = datetime.now().astimezone()
+        real_job = self.monitor.job
+
+        def timed_job(token, state):
+            job = real_job(token, state)
+            if state == DeviceJobState.COMPLETED:
+                index = self.monitor.completed_tokens.index(token)
+                job = replace(job, started_at=origin, ended_at=origin + timedelta(seconds=25 + index * 10))
+            return job
+
+        self.monitor.job = timed_job
+
+    def test_production_learning_subtracts_queue_wait_and_keeps_numeric_profiles(self):
+        self.install_device_timestamps()
+        records = self.run_worker()
+        completed = [record for record in records if record["event"] == "job_physically_completed"]
+        self.assertEqual([None, 10, 10, 10], [record["eta_service_seconds"] for record in completed])
+        self.assertEqual([10, 10, 10], [sample.seconds for sample in self.app.eta_job_timing_samples()])
+        self.assertIsNotNone(records[-1]["eta_initial_error_seconds"])
+        self.assertEqual(4, records[-1]["eta_initial_job_count"])
+
+    def test_production_learning_rejects_jobs_spanning_device_hold(self):
+        self.install_device_timestamps()
+        self.monitor.hold_steps = ["held", "resumed"]
+        records = self.run_worker()
+        completed = [record for record in records if record["event"] == "job_physically_completed"]
+        self.assertEqual([None, None, 10, 10], [record["eta_service_seconds"] for record in completed])
+        self.assertEqual([10, 10], [sample.seconds for sample in self.app.eta_job_timing_samples()])
+
+    def test_production_learning_does_not_treat_other_users_queue_as_engine_time(self):
+        self.install_device_timestamps()
+        real_wait = self.monitor.wait_for_change
+
+        def with_external_job(*args):
+            snapshot = real_wait(*args)
+            if len(self.monitor.completed_tokens) < 2:
+                foreign = DeviceJob("external", state=DeviceJobState.PRINTING)
+                snapshot = replace(snapshot, active_jobs=snapshot.active_jobs + (foreign,))
+                self.monitor._snapshot = snapshot
+            return snapshot
+
+        self.monitor.wait_for_change = with_external_job
+        records = self.run_worker()
+        completed = [record for record in records if record["event"] == "job_physically_completed"]
+        self.assertEqual([None, None, 10, 10], [record["eta_service_seconds"] for record in completed])
+        self.assertEqual([10, 10], [sample.seconds for sample in self.app.eta_job_timing_samples()])
+
+    def test_verified_open_cassette_does_not_hold_or_resend_in_production_worker(self):
+        from test_unit_print_device_status import _ScriptedCanonClient
+
+        portal = '''<script>
+          var prt_status = "33";
+          var errCodeTbl = new Array(0x1180202);
+          var cstInfo = {
+            "1":{"cstName":"카세트 1","pSizeName":"A4","remainPapVol":"3","totalPapVol":"3"},
+            "2":{"cstName":"카세트 2","pSizeName":"A4","remainPapVol":"0","totalPapVol":"3"}
+          };
+          var tonerVolInfo = {"tonerKVol":"50"};
+        </script>'''
+        loading = _ScriptedCanonClient({"portal": portal, "/sysmonitor": "ok",
+                                        "active_jobs": "<table></table>",
+                                        "job_log": "<table></table>"}).read_snapshot()
+        self.assertTrue(loading.can_dispatch)
+        wait = self.monitor.wait_for_change
+
+        def wait_with_loading(observed_at, timeout):
+            snapshot = wait(observed_at, timeout)
+            self.monitor._snapshot = replace(
+                snapshot, health=loading.health, status_text=loading.status_text,
+                errors=loading.errors, consumables=loading.consumables,
+            )
+            return self.monitor._snapshot
+
+        self.monitor._snapshot = loading
+        self.monitor.wait_for_change = wait_with_loading
+        self.app.ensure_device_monitor_ready_for_print(self.options)
+        records = self.run_worker()
+        self.assertEqual(4, self.enqueue.call_count)
+        self.assertEqual(["send", "acknowledge"] * 4, [event[0] for event in self.monitor.events])
+        self.app.enter_device_hold.assert_not_called()
+        self.assertNotIn("device_dispatch_held", [r["event"] for r in records])
+        self.assertEqual("device_jobs_completed", records[-1]["outcome"])
+        self.assertTrue(records[-1]["physical_output_verified"])
+
     def test_history_fingerprint_matches_sent_copy_when_source_changes_after_copy(self):
         from unit_print_device_scheduler import prepare_dispatch_copy
 

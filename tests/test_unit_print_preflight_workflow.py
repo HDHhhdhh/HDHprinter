@@ -158,11 +158,13 @@ class PreviewPreflightTests(unittest.TestCase):
         app.preview_preflight_pending_paths.add(Path("first.pdf"))
         app.pdf_preflight_signature.side_effect = RuntimeError("unexpected filesystem error")
         app.start_preview_preflight_batch()
+        self.run_worker()
         app.root.flush()
         self.assertFalse(app.preview_preflight_active)
         self.assertIsNone(app.preview_preflight_completed)
         self.assertFalse(app.root.callbacks)
-        self.worker.assert_not_called()
+        self.assertEqual(1, self.worker.call_count)
+        self.inspect.assert_not_called()
         app.log.assert_called_once()
 
     def test_closed_app_consumes_completion_without_ui_updates_or_next_batch(self):

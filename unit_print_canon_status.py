@@ -373,17 +373,15 @@ _ERROR_PHRASES = (
 # errCodeTbl as well as setting prt_status=0x20.  An arbitrary non-null
 # errCodeTbl entry must continue to block dispatch.
 _A4_PAPER_WARNING_CODES = {"0x1060202"}
+# Physically matched on this Canon: drawer 1 open/close, and drawer 2 open
+# while one test sheet printed from the other drawer (2026-10-01).
+# Do not generalize the firmware's variable mask to untested feed positions.
+_CASSETTE_OPEN_CODES = {0x01180102: 1, 0x01180202: 2}
+_CASSETTE_OPEN_MESSAGE = "A4 카세트가 열려 있습니다. 용지를 보충한 뒤 닫아 주세요."
 
 
-def _script_health(html: str) -> tuple[DeviceHealth, str, tuple[str, ...]] | None:
-    """Read the current portal status variables, ignoring message templates.
-
-    Older imageRUNNER Remote UI pages ship every possible status sentence in
-    JavaScript.  Searching the full script text therefore produces both false
-    READY and false ERROR results.  ``prt_status`` and ``errCodeTbl`` are the
-    page's actual current values on this firmware generation.
-    """
-
+def _portal_status_values(html: str) -> tuple[int | None, tuple[str, ...]] | None:
+    """Extract current values only; static error-message templates are ignored."""
     status_match = re.search(
         r"\bvar\s+prt_status\s*=\s*['\"]?((?:0[xX])?[0-9A-Fa-f]+)['\"]?",
         html,
@@ -410,6 +408,33 @@ def _script_health(html: str) -> tuple[DeviceHealth, str, tuple[str, ...]] | Non
         except ValueError:
             pass
 
+    return status_code, tuple(error_codes)
+
+
+def _open_cassettes(status_code: int | None, error_codes: tuple[str, ...]) -> tuple[int, ...]:
+    # 0x20/0x21 were observed during idle/printing with a drawer open.
+    # Missing, reserved or additional hard-error bits never open the gate.
+    if status_code not in (0x20, 0x21) or not error_codes:
+        return ()
+    try:
+        codes = tuple(int(code, 16) for code in error_codes if re.fullmatch(r"0[xX][0-9a-fA-F]+", code))
+    except ValueError:
+        return ()
+    if len(codes) != len(error_codes) or any(code not in _CASSETTE_OPEN_CODES for code in codes):
+        return ()
+    return tuple(sorted({_CASSETTE_OPEN_CODES[code] for code in codes}))
+
+
+def _script_health(html: str) -> tuple[DeviceHealth, str, tuple[str, ...]] | None:
+    """Read current portal status variables, ignoring the message catalogue."""
+    values = _portal_status_values(html)
+    if values is None:
+        return None
+    status_code, error_codes = values
+    if opened := _open_cassettes(status_code, error_codes):
+        labels = ", ".join(f"카세트 {number}" for number in opened)
+        # Still blocking until the full snapshot proves another A4 drawer can feed.
+        return DeviceHealth.HELD, f"{labels} 용지 보충 중", (_CASSETTE_OPEN_MESSAGE,)
     if error_codes:
         if (
             {code.casefold() for code in error_codes} <= _A4_PAPER_WARNING_CODES
@@ -567,6 +592,47 @@ def reconcile_a4_paper_health(
             (),
         )
     return health, status, errors
+
+
+def _reconcile_cassette_open_health(
+    html: str,
+    health: DeviceHealth,
+    status: str,
+    errors: tuple[str, ...],
+    consumables: DeviceConsumables,
+    *,
+    has_active_jobs: bool,
+) -> tuple[DeviceHealth, str, tuple[str, ...]] | None:
+    """Resolve only verified drawer-open attention against closed A4 drawers.
+
+    The open drawer's 0% is not proof of empty paper. Visible faults and mixed
+    or unknown codes retain their existing blocking behavior.
+    """
+    if health != DeviceHealth.HELD or errors != (_CASSETTE_OPEN_MESSAGE,):
+        return None
+    values = _portal_status_values(html)
+    if values is None:
+        return None
+    status_code, codes = values
+    opened = _open_cassettes(status_code, codes)
+    if not opened:
+        return None
+    closed_numbers = {1, 2}.difference(opened)
+    closed_labels = {f"카세트 {number}" for number in closed_numbers}
+    available = any(
+        source.source.strip() in closed_labels
+        and source.level_max_percent is not None
+        and source.level_max_percent > 0
+        for source in consumables.a4_sources
+    )
+    if not available:
+        return health, status, errors
+    busy = has_active_jobs or status_code == 0x21
+    return (
+        DeviceHealth.BUSY if busy else DeviceHealth.READY,
+        f"{'인쇄 중' if busy else '인쇄 가능'} · {status}",
+        (),
+    )
 
 
 _TOKEN_RE = re.compile(r"QP[_-]([A-Z0-9]{8,32})", re.I)
@@ -987,13 +1053,20 @@ class CanonStatusClient:
         if active_jobs and health == DeviceHealth.READY:
             health = DeviceHealth.BUSY
             status = "인쇄 중"
-        health, status, errors = reconcile_a4_paper_health(
-            health,
-            status,
-            errors,
-            consumables,
+        loading_health = _reconcile_cassette_open_health(
+            portal, health, status, errors, consumables,
             has_active_jobs=bool(active_jobs),
         )
+        if loading_health is not None:
+            health, status, errors = loading_health
+        else:
+            health, status, errors = reconcile_a4_paper_health(
+                health,
+                status,
+                errors,
+                consumables,
+                has_active_jobs=bool(active_jobs),
+            )
         identity = serial or self.base_url
         device_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         return DeviceSnapshot(

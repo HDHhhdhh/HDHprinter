@@ -78,10 +78,23 @@ WSD, USB, Microsoft IPP/Class Driver는 합격 처리하지 않는다. Canon 공
 
 ## 2단계: 코드와 배포 자료 검사
 
+앱을 실행하기 전에 `fonts/README.md`를 읽는다. `fonts/Pretendard`의 Regular/Bold/Medium/SemiBold **네 TTF 파일만** Windows에 설치한다. 제작 PC와 같은 Pretendard v1.3.9(`Version 1.309`) 파일이다. 다른 굵기, Variable, OTF 또는 최신 버전을 추가하지 않는다. [Microsoft의 파일 글꼴 설치 절차](https://support.microsoft.com/en-us/windows/experience/personalization/manage-fonts-in-windows)를 따른다. 현재 런타임이 네이티브 조작을 제공하지 않으면 사용자가 이 설치 단계만 직접 수행한다. 지원되지 않는 조작 경로로 우회하지 않는다.
+
+앱을 닫고 설치 후 새 프로세스로 다음 명령을 실행한다.
+
+```powershell
+& ".venv\Scripts\python.exe" "scripts\verify_quick_printer_fonts.py"
+```
+
+`issues`가 빈 목록이며 앱의 `ui_font_family`와 normal/bold 실제 family가 모두 `Pretendard`여야 한다. 파일별 설치 SHA-256도 정본과 같아야 한다. 기존 같은 이름 글꼴이 다르면 자동 덮어쓰기나 삭제를 하지 않는다. 소스를 바꿔 대체 글꼴을 쓰면서 동일환경으로 판정하지 않는다. OFL 저작권과 라이선스는 `fonts/Pretendard/LICENSE.txt`에 포함한다. Windows 맑은 고딕/Yu Gothic 및 윤고딕 파일은 배포하지 않는다. 글꼴 일치만으로 픽셀 동일성을 판단하지 않으며 기준 GUI 자료의 Python/Tk·배율·화면/창 크기도 맞춘다.
+
+앱 가상환경이 아직 없으면 글꼴 네 파일을 먼저 설치한 뒤 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_quick_printer.ps1 -SkipAssetSync`를 실행한다. 설치 스크립트는 Python 환경을 준비한 뒤 같은 글꼴 검사를 수행한다. 정본 설치 중 PDF 업데이트 동기화는 실행하지 않는다. 설치가 끝나면 아래 전체 SHA-256 검사도 실행한다. ZIP 다운로드 채널과 `quick_printer_asset_channel.local.json`의 이후 PDF 업데이트 채널은 목적이 다르다.
+
 설치 폴더에서 가능한 검사를 모두 실행한다.
 
 ```powershell
 & ".venv\Scripts\python.exe" "scripts\verify_quick_printer_release.py" --root . --fast
+& ".venv\Scripts\python.exe" "scripts\verify_quick_printer_release.py" --root .
 & ".venv\Scripts\python.exe" -m py_compile unit_print_manager.py unit_print_name_separator.py unit_print_pdf_printing.py unit_print_printer_setup.py
 & ".venv\Scripts\python.exe" -m unittest discover -s tests -p "test_unit_print*.py"
 ```

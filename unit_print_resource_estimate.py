@@ -16,7 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from unit_print_device_state import DeviceConsumables
-from unit_print_eta import EtaEstimate, estimate_remaining_seconds, estimated_sheets
+from unit_print_eta import EtaEstimate, EtaTimingSample, EtaWorkload, estimate_workloads_seconds, estimated_sheets
 
 
 # Canon imageRUNNER ADVANCE 8585i III standard paper supply:
@@ -49,6 +49,7 @@ class ResourceJob:
     stapled: bool = True
     known_page_count: int | None = None
     label: str = ""
+    dispatch_jobs: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +101,11 @@ class PrintResourceEstimate:
 
     @property
     def display_text(self) -> str:
+        return self.display_text_with_eta()
+
+    def display_text_with_eta(self, completion_text: str | None = None) -> str:
         sheet_prefix = "A4" if self.is_complete else "A4 최소"
-        eta_text = self.eta.display_text if self.is_complete else "시간 일부 계산 불가"
+        eta_text = (completion_text or self.eta.display_text) if self.is_complete else "시간 일부 계산 불가"
         return (
             f"예상 {sheet_prefix} {self.total_sheets:,}장 · "
             f"스테이플 {self.staple_sets:,}회 · {eta_text} · {self.paper_label}"
@@ -109,8 +113,11 @@ class PrintResourceEstimate:
 
     @property
     def compact_text(self) -> str:
+        return self.compact_text_with_eta()
+
+    def compact_text_with_eta(self, completion_text: str | None = None) -> str:
         sheet_prefix = "A4" if self.is_complete else "A4≥"
-        eta_text = self.eta.display_text if self.is_complete else "시간 확인 중"
+        eta_text = (completion_text or self.eta.display_text) if self.is_complete else "시간 확인 중"
         return (
             f"{sheet_prefix} {self.total_sheets:,} · S {self.staple_sets:,} · "
             f"{eta_text} · {self.paper_label.replace('용지 ', '')}"
@@ -118,11 +125,18 @@ class PrintResourceEstimate:
 
     @property
     def detail_text(self) -> str:
+        return self.detail_text_with_eta()
+
+    def detail_text_with_eta(self, completion_text: str | None = None) -> str:
         lines = [
             f"예상 자원: A4 {'최소 ' if not self.is_complete else ''}{self.total_sheets:,}장, "
             f"스테이플 {self.staple_sets:,}회, "
             f"{self.eta.display_text if self.is_complete else '예상 시간 일부 계산 불가'}"
         ]
+        if completion_text and self.is_complete:
+            lines.append(completion_text)
+            if "예상 완료" in completion_text and ":" in completion_text:
+                lines.append(f"예측 기준: {self.eta.confidence} · 실제 완료는 프린터 작업 이력으로 확인합니다.")
         capacity = self.paper_capacity
         if capacity is not None:
             qualifier = "" if capacity.is_complete else "확인 가능한 카세트 기준 "
@@ -229,6 +243,7 @@ def estimate_print_resources(
     duplex: bool,
     consumables: DeviceConsumables | None = None,
     verified_seconds_per_sheet: Iterable[float] = (),
+    timing_samples: tuple[EtaTimingSample, ...] = (),
     staple_capacity_sheets: int = DEFAULT_STAPLE_CAPACITY_SHEETS,
     cancelled: Callable[[], bool] | None = None,
 ) -> PrintResourceEstimate:
@@ -240,6 +255,7 @@ def estimate_print_resources(
     unknown_documents = 0
     oversize_staple_sets = 0
     page_counts: dict[Path, int | None] = {}
+    workloads: list[EtaWorkload] = []
 
     for job in jobs:
         if cancelled is not None and cancelled():
@@ -265,21 +281,15 @@ def estimate_print_resources(
         output_pages_per_copy = math.ceil(page_count / pages_per_sheet)
         sheets_per_copy = estimated_sheets(output_pages_per_copy, 1, duplex)
         total_sheets += sheets_per_copy * copies
+        workloads.append(EtaWorkload(sheets_per_copy * copies, copies, max(1, job.dispatch_jobs), duplex))
         if job.stapled and sheets_per_copy >= 2:
             staple_sets += copies
             if sheets_per_copy > max(1, int(staple_capacity_sheets)):
                 oversize_staple_sets += copies
 
-    clean_samples = tuple(
-        float(value)
-        for value in verified_seconds_per_sheet
-        if isinstance(value, (int, float))
-    )
-    eta = estimate_remaining_seconds(
-        total_sheets,
-        clean_samples,
-        remaining_jobs=output_sets,
-    )
+    # Legacy scalar rates lack document sizes and can contain queue latency.
+    # Keep the argument compatible, but use classified physical timings.
+    eta = estimate_workloads_seconds(tuple(workloads), timing_samples)
     capacity = estimate_a4_capacity(consumables)
     readiness = assess_paper_readiness(
         total_sheets,

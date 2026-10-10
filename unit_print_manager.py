@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -42,6 +42,7 @@ from unit_print_execution import (
     QUEUE_EMPTY_TIMEOUT_SECONDS, QUEUE_REFILL_TIMEOUT_SECONDS,
 )
 from unit_print_pdf_metadata import get_pdf_page_count
+from unit_print_preview import PreviewRequest, PreviewWorker
 from unit_print_queue_recovery import RECOVERY_DIRECTORY, RecoveryStore, RecoveryWriter
 from unit_print_recovery_history import classify_recovery_queue
 from unit_print_history import HISTORY_DIRECTORY
@@ -60,10 +61,21 @@ from unit_print_device_scheduler import (
 )
 from unit_print_device_state import DeviceHealth, DeviceJob, DeviceJobState, DeviceSnapshot
 from unit_print_device_ui import build_device_status_view
+from unit_print_theme import WORKBENCH_COLORS, QUEUE_CARD_RADIUS, apply_workbench_styles
+from unit_print_typography import korean_label
 from unit_print_eta import (
+    CompletionTimeProjection,
+    PrintEtaObservation,
     ETA_PRINT_RATE_CONFIG_KEY,
     ETA_SAMPLE_LIMIT,
-    completed_job_seconds_per_sheet,
+    ETA_TIMING_CONFIG_KEY,
+    ETA_TIMING_DEVICE_KEY,
+    ETA_TIMING_SAMPLE_LIMIT,
+    EtaTimingSample,
+    completed_job_timing,
+    initialize_timing_samples,
+    timing_device_key,
+    validated_timing_samples,
 )
 from unit_print_notifications import (
     NotificationGate,
@@ -75,6 +87,7 @@ from unit_print_resource_estimate import (
     ResourceJob,
     estimate_print_resources,
 )
+from unit_print_source_paths import SourceFolderOpenResult, open_source_folders, source_folder_targets
 
 from unit_print_pdf_printing import (
     A4_HEIGHT_POINTS,
@@ -156,6 +169,7 @@ from unit_print_retry import RetryBatch, retry_from_failure
 from unit_print_progress import (
     PersistentAlertSpec,
     PrintProgressState,
+    RunPhase,
     persistent_alert_for_status,
     transition_taskbar_state,
 )
@@ -230,6 +244,12 @@ except Exception:
 
 
 APP_TITLE = "빠른 인쇄기"
+QUEUE_EDITOR_VARIABLE_NAMES = (
+    "edit_subject_var", "edit_level_var", "edit_round_var",
+    "edit_start_var", "edit_end_var", "edit_selected_numbers_var",
+    "edit_name_separator_var", "edit_copies_var", "edit_bundle_var",
+    "edit_printer_route_var",
+)
 APP_DIR = Path(__file__).resolve().parent
 BUNDLED_DATA_ROOT = LOCAL_DATA_ROOT
 LEGACY_DEFAULT_ROOT = Path(r"D:\테스트\단원평가")
@@ -341,9 +361,12 @@ def match_order_choice(value: object, choices: tuple[str, ...] | list[str], fiel
 
 
 def make_queue_bundle_block(
-    blocks: list[PrintBlock], cache_dir: Path, *, base_printer: str | None = None,
+    blocks: list[PrintBlock], cache_dir: Path | None = None, *, base_printer: str | None = None,
 ) -> PrintBlock:
-    """Turn ordinary queue blocks into one physical, staplable PDF per copy."""
+    """Repeat the original document sequence once per copy, without PDF merging.
+
+    ``cache_dir`` remains accepted for existing callers; no PDF is created here.
+    """
     if len(blocks) < 2:
         raise ValueError("묶을 일반 블록을 두 개 이상 선택해 주세요.")
     if any(block.bundled for block in blocks):
@@ -408,13 +431,14 @@ def make_queue_bundle_block(
         raise ValueError("서로 다른 프린터로 전송되는 블록은 묶을 수 없습니다.")
 
     title = f"선택 묶음 ({len(blocks)}개 블록)"
-    merged_path = materialize_pdf_documents(
-        [item.path for item in files], cache_dir, f"선택_묶음_{len(blocks)}개"
-    )
+    ordered_files = [
+        replace(item, printer_override=printer, pages_per_sheet=pages_per_sheet)
+        for item, (printer, pages_per_sheet) in zip(files, settings)
+    ]
     return PrintBlock(
-        subject="선택 묶음", level="", round_name="직접", start=1, end=1,
+        subject="선택 묶음", level="", round_name="직접", start=1, end=len(ordered_files),
         copies=blocks[0].copies,
-        files=[ExamPdf(1, title, merged_path)],
+        files=ordered_files,
         bundled=True, source="custom", printer_override=next(iter(overrides), None),
         display_label=title, printer_route=route,
         name_separator_label=next(iter(names)), material_kind="queue_bundle",
@@ -1197,30 +1221,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.left_panel_width = 540
         self.queue_panel_width = 520
         self.queue_status_pixel_width = 160
-        self.colors = {
-            "app_bg": "#f3f7fb",
-            "panel": "#ffffff",
-            "panel_soft": "#edf3f8",
-            "border": "#d5e1eb",
-            "border_soft": "#e5edf4",
-            "text": "#263746",
-            "muted": "#6a7c8d",
-            "muted_soft": "#a8b8c6",
-            "accent": "#2f6f9f",
-            "accent_hover": "#255b82",
-            "accent_soft": "#e3eff8",
-            "link": "#2f6f9f",
-            "danger": "#a84a43",
-            "danger_soft": "#faece9",
-            "success": "#2f6f9f",
-            "success_soft": "#e3eff8",
-            "warning": "#9a6b24",
-            "warning_soft": "#f8f0df",
-            "log_bg": "#263746",
-            "log_text": "#f3f8fc",
-        }
+        self.colors = dict(WORKBENCH_COLORS)
         self.ui_font_family = self.resolve_ui_font_family()
-        self.queue_line_font = tkfont.Font(family=self.ui_font_family, size=11, weight="bold")
+        self.queue_line_font = tkfont.Font(family=self.ui_font_family, size=11)
+        self.queue_line_bold_font = tkfont.Font(family=self.ui_font_family, size=11, weight="bold")
+        self.queue_meta_font = tkfont.Font(family=self.ui_font_family, size=10)
+        self.queue_status_font = tkfont.Font(family=self.ui_font_family, size=10, weight="bold")
         self.is_printing = False
         self.is_closing = False
         self.pdf_work_scheduler = PriorityWorkScheduler()
@@ -1242,6 +1248,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.resource_estimate_poll_after_id: str | None = None
         self.latest_resource_estimate: PrintResourceEstimate | None = None
         self.latest_resource_estimate_key: object | None = None
+        self.resource_completion_projection: CompletionTimeProjection | None = None
+        self.resource_completion_key: object | None = None
+        self.resource_completion_override: str | None = None
+        self.resource_completion_run_key: object | None = None
+        self.active_resource_eta: PrintEtaObservation | None = None
         self.able_build_pending = False
         self.order_build_pending = False
         self.group_build_pending = False
@@ -1257,6 +1268,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         configured_device_monitor = self.config.get("device_monitor", {})
         self.device_monitor_config: dict[str, object] = (
             dict(configured_device_monitor) if isinstance(configured_device_monitor, dict) else {}
+        )
+        initialize_timing_samples(
+            self.device_monitor_config,
+            APP_DIR / "output" / "unit_print_manager" / "cache" / "eta_job_timing_bootstrap.json",
         )
         try:
             dispatch_policy_version = int(
@@ -1310,6 +1325,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.keyboard_state = KeyboardState()
         self.keyboard_latches: set[str] = set()
         self.editor_syncing = False
+        self.editor_block: PrintBlock | None = None
+        self.editor_baseline: tuple[str, ...] | None = None
+        self.editor_save_in_progress = False
 
         root.title(APP_TITLE)
         root.geometry("1280x820")
@@ -1583,16 +1601,14 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             return
         message = self.app_status_var.get()
         colors = self.colors
-        if "오류" in message or "실패" in message:
+        if any(marker in message for marker in ("오류", "실패", "경고", "중지")):
             bg, fg, label = colors["danger_soft"], colors["danger"], f"상태  {message}"
-        elif "인쇄 완료" in message:
+        elif any(marker in message for marker in ("인쇄 중", "전송 중", "확인 중", "준비 중", "처리 중")):
             bg, fg, label = colors["success_soft"], colors["success"], f"상태  {message}"
-        elif "인쇄 중" in message or "전송" in message:
-            bg, fg, label = colors["warning_soft"], colors["warning"], f"상태  {message}"
         elif "완료" in message:
-            bg, fg, label = colors["success_soft"], colors["success"], f"상태  {message}"
+            bg, fg, label = colors["complete_soft"], colors["complete"], f"상태  {message}"
         else:
-            bg, fg, label = colors["success_soft"], colors["success"], f"상태  {message}"
+            bg, fg, label = colors["complete_soft"], colors["complete"], f"상태  {message}"
         self.status_badge.configure(text=label, bg=bg, fg=fg, highlightbackground=fg)
 
     def refresh_device_status_badge(self, health: DeviceHealth | None = None) -> None:
@@ -1601,17 +1617,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         message = self.device_status_var.get()
         colors = self.colors
         if health in {DeviceHealth.ERROR, DeviceHealth.HELD, DeviceHealth.OFFLINE} or any(
-            marker in message for marker in ("오류", "실패", "오프라인")
+            marker in message for marker in ("오류", "실패", "경고", "오프라인")
         ):
             bg, fg = colors["danger_soft"], colors["danger"]
-        elif health == DeviceHealth.READY or message.startswith("프린터 인쇄 가능"):
+        elif health == DeviceHealth.BUSY or (health != DeviceHealth.READY and any(
+            marker in message for marker in ("연결 중", "인쇄 중", "확인 중", "준비 중")
+        )):
             bg, fg = colors["success_soft"], colors["success"]
-        elif health == DeviceHealth.BUSY or any(
-            marker in message for marker in ("연결 중", "인쇄 중", "확인 중")
-        ):
-            bg, fg = colors["warning_soft"], colors["warning"]
         else:
-            bg, fg = colors["accent_soft"], colors["accent"]
+            bg, fg = colors["complete_soft"], colors["complete"]
         self.device_status_badge.configure(
             text=message,
             bg=bg,
@@ -1643,9 +1657,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         colors = self.colors
         palette = {
             "success": (colors["success_soft"], colors["success"]),
-            "warning": (colors["warning_soft"], colors["warning"]),
+            "warning": (colors["danger_soft"], colors["danger"]),
+            "waiting": (colors["warning_soft"], colors["warning"]),
             "danger": (colors["danger_soft"], colors["danger"]),
             "secondary": (colors["panel_soft"], colors["muted"]),
+            "info": (colors["complete_soft"], colors["complete"]),
         }
         background, foreground = palette.get(tone, palette["secondary"])
         badge.configure(
@@ -1665,13 +1681,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if width >= 1900 or width <= 1:
             display = full_text
         elif width >= 1600 and estimate is not None:
-            display = estimate.compact_text
+            display = self.resource_estimate_display_text(compact=True)
         elif "계산 중" in full_text:
             display = "자원 계산 중"
         elif "실패" in full_text:
             display = "자원 계산 실패"
         elif "작업 큐 없음" in full_text:
             display = "예상 자원 없음"
+        elif self.resource_completion_text() is not None:
+            display = self.resource_completion_text().replace("예상 완료 시간 ", "예상 완료 ")
         else:
             display = "예상 자원 보기"
         if variable.get() != display:
@@ -1680,19 +1698,185 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
     def show_resource_estimate_details(self, _event: tk.Event | None = None) -> None:
         estimate = getattr(self, "latest_resource_estimate", None)
         message = (
-            estimate.detail_text
+            self.resource_estimate_detail_text()
             if estimate is not None
             else getattr(self, "resource_estimate_full_text", "예상 자원 정보가 없습니다.")
         )
         messagebox.showinfo(APP_TITLE, message, parent=self.root)
 
+    def resource_completion_now(self) -> datetime:
+        return datetime.now().astimezone()
+
+    def resource_completion_text(self) -> str | None:
+        override = getattr(self, "resource_completion_override", None)
+        if override is not None:
+            return override
+        observation = getattr(self, "active_resource_eta", None)
+        if observation is None and getattr(self, "latest_resource_estimate", None) is None:
+            return None
+        projection = getattr(self, "resource_completion_projection", None)
+        if projection is None:
+            return None
+        now = self.resource_completion_now()
+        if observation is not None:
+            return observation.display_text(projection, now)
+        text = projection.display_text(
+            now, overdue_text="완료 확인 중" if getattr(self, "is_printing", False) else "시작 시 재계산",
+        )
+        if getattr(self, "retry_batch", None) is not None:
+            text = text.replace("예상 완료 시간", "미전송 작업 예상 완료 시간")
+        return text
+
+    def resource_estimate_display_text(self, *, compact: bool = False) -> str:
+        estimate = getattr(self, "latest_resource_estimate", None)
+        completion = self.resource_completion_text()
+        observation = getattr(self, "active_resource_eta", None)
+        if observation is not None:
+            prefix = "남은 A4" if observation.complete else "남은 A4 최소"
+            jobs = len(observation.remaining_job_ids)
+            paper = f" · {estimate.paper_label}" if isinstance(estimate, PrintResourceEstimate) else ""
+            return (f"{prefix} {observation.remaining_sheets:,}장 · 미완료 {jobs:,}건 · "
+                    f"{completion}{paper}")
+        if getattr(self, "resource_completion_override", None) is not None:
+            return completion
+        if isinstance(estimate, PrintResourceEstimate):
+            formatter = estimate.compact_text_with_eta if compact else estimate.display_text_with_eta
+            return formatter(completion)
+        if estimate is not None:
+            return estimate.compact_text if compact else estimate.display_text
+        return completion or getattr(self, "resource_estimate_full_text", "예상 자원 정보가 없습니다.")
+
+    def resource_estimate_detail_text(self) -> str:
+        estimate = getattr(self, "latest_resource_estimate", None)
+        if isinstance(estimate, PrintResourceEstimate):
+            detail = estimate.detail_text_with_eta(self.resource_completion_text())
+            observation = getattr(self, "active_resource_eta", None)
+            if observation is not None:
+                detail += (f"\n현재 미완료 작업: {len(observation.remaining_job_ids):,}건, "
+                           f"A4 {'최소 ' if not observation.complete else ''}{observation.remaining_sheets:,}장")
+                if observation.complete and observation.remaining_job_ids:
+                    detail += f"\n현재 남은 소요시간 범위: {observation.eta.display_text} (관측 시점 기준)"
+            return detail
+        return estimate.detail_text if estimate is not None else self.resource_estimate_display_text()
+
+    def refresh_resource_completion_clock(self) -> None:
+        """Refresh dates/overdue wording without moving the anchored deadline."""
+        if getattr(self, "is_closing", False) or self.resource_completion_text() is None:
+            return
+        text = self.resource_estimate_display_text()
+        if text != getattr(self, "resource_estimate_full_text", None):
+            self.set_resource_estimate_text(text, getattr(self, "resource_estimate_tone", "secondary"))
+
+    def adopt_resource_estimate(self, estimate: PrintResourceEstimate, request_key: object) -> None:
+        retain_run = getattr(self, "resource_completion_run_key", None) == (
+            getattr(self, "resource_estimate_revision", 0), request_key,
+        )
+        self.latest_resource_estimate = estimate
+        self.latest_resource_estimate_key = request_key
+        if not getattr(self, "is_printing", False) and not retain_run:
+            self.active_resource_eta = None
+            self.resource_completion_override = None
+            if isinstance(estimate, PrintResourceEstimate) and estimate.is_complete:
+                key = ("waiting", getattr(self, "resource_estimate_duration_key", request_key), estimate.eta)
+                if key != getattr(self, "resource_completion_key", None):
+                    self.resource_completion_projection = CompletionTimeProjection(estimate.eta, self.resource_completion_now())
+                    self.resource_completion_key = key
+            else:
+                self.resource_completion_projection = None
+                self.resource_completion_key = None
+        tone = (getattr(self, "resource_estimate_tone", estimate.tone)
+                if getattr(self, "is_printing", False) or retain_run else estimate.tone)
+        self.set_resource_estimate_text(self.resource_estimate_display_text(), tone)
+
+    def begin_resource_estimate_run(self, options: PrintRunOptions) -> None:
+        self.resource_completion_run_key = (
+            getattr(self, "resource_estimate_revision", 0),
+            getattr(self, "resource_estimate_request_key", getattr(self, "latest_resource_estimate_key", None)),
+        )
+        self.active_resource_eta = None
+        self.resource_completion_key = None
+        self.resource_completion_projection = None
+        self.resource_completion_override = None
+        estimate = getattr(self, "latest_resource_estimate", None)
+        if options.dry_run:
+            self.resource_completion_override = "미리보기 · 완료 시각 계산 안 함"
+        elif options.device_completion_mode:
+            self.resource_completion_override = "예상 완료 시간 계산 중"
+        elif isinstance(estimate, PrintResourceEstimate) and estimate.is_complete:
+            self.resource_completion_projection = CompletionTimeProjection(estimate.eta, self.resource_completion_now())
+        else:
+            self.resource_completion_override = "예상 완료 시간 일부 계산 불가"
+        tone = "waiting" if options.dry_run else "danger" if self.resource_completion_override == "예상 완료 시간 일부 계산 불가" else "success"
+        self.set_resource_estimate_text(self.resource_estimate_display_text(), tone)
+
+    def update_print_resource_eta(self, observation: PrintEtaObservation) -> None:
+        if getattr(self, "is_closing", False):
+            return
+        def update() -> None:
+            state = getattr(self, "print_progress_state", None)
+            current_run = state.run_id if state is not None else getattr(self, "history_run_id", None)
+            cancel = getattr(self, "print_cancel_event", None)
+            if (getattr(self, "is_closing", False) or observation.run_id != current_run
+                    or (cancel is not None and cancel.is_set())
+                    or (state is not None and state.phase in {RunPhase.COMPLETE, RunPhase.ERROR, RunPhase.STOPPED, RunPhase.STOPPING, RunPhase.IDLE})):
+                return
+            self.active_resource_eta = observation
+            self.resource_completion_override = None
+            if observation.anchor_key != getattr(self, "resource_completion_key", None):
+                self.resource_completion_projection = CompletionTimeProjection(observation.eta, observation.observed_at)
+                self.resource_completion_key = observation.anchor_key
+            tone = "danger" if not observation.complete or observation.held else "waiting" if not observation.remaining_job_ids else "success"
+            estimate = getattr(self, "latest_resource_estimate", None)
+            if isinstance(estimate, PrintResourceEstimate) and estimate.tone in {"warning", "danger"}:
+                tone = "danger"
+            self.set_resource_estimate_text(self.resource_estimate_display_text(), tone)
+
+        if threading.current_thread() is threading.main_thread():
+            update()
+        else:
+            try:
+                self.root.after(0, update)
+            except tk.TclError:
+                pass
+
+    def invalidate_resource_completion_for_append(self) -> None:
+        options = getattr(self, "print_run_options", None)
+        if options is not None and options.device_completion_mode:
+            self.resource_completion_override = "예상 완료 시간 갱신 중"
+        else:
+            # Windows submitted counts do not identify physically unfinished
+            # pages. Do not pretend the old run's finish time covers an append.
+            self.resource_completion_override = "예상 완료 시간 재계산 필요"
+        self.set_resource_estimate_text(self.resource_estimate_display_text(), "waiting")
+
+    def update_resource_completion_status(self, message: str) -> None:
+        text_and_tone = {
+            "실제 인쇄 완료": ("실제 인쇄 완료", "info"),
+            "미리보기 완료": ("미리보기 완료", "info"),
+            "전송 완료 / 인쇄 완료": ("Windows 대기열 비움 · 실제 완료 시각 확인 불가", "waiting"),
+            "전송 완료 / 인쇄 중": ("완료 확인 중", "waiting"),
+            "프린터 오류 / 인쇄 일시 중지": ("인쇄 중지 · 재개 시 재계산", "danger"),
+            "전송 중지 요청됨": ("인쇄 중지 · 재개 시 재계산", "waiting"),
+            "전송 중지됨": ("인쇄 중지 · 재개 시 재계산", "waiting"),
+            "완료 확인 중지됨": ("완료 확인 중지 · 실제 완료 시각 확인 불가", "waiting"),
+            "전송 완료 / 완료 확인 중지": ("완료 확인 중지 · 실제 완료 시각 확인 불가", "waiting"),
+            "오류 발생": ("예상 완료 시간 계산 중단", "danger"),
+            "전송 완료 / 대기열 확인 실패": ("예상 완료 시간 계산 중단", "danger"),
+        }
+        if message not in text_and_tone:
+            return
+        self.resource_completion_override, tone = text_and_tone[message]
+        self.set_resource_estimate_text(self.resource_estimate_display_text(), tone)
+
     def resource_estimate_jobs(self, blocks: list[PrintBlock]) -> tuple[ResourceJob, ...]:
         """Capture a Tk-free resource recipe without building separator PDFs."""
 
         jobs: list[ResourceJob] = []
+        include_names = bool(self.name_separator_page_var.get())
+        include_separator = bool(self.separator_page_var.get())
         grouped_name_labels = (
             name_separator_group_labels(blocks)
-            if self.name_separator_page_var.get()
+            if include_names
             else (None,) * len(blocks)
         )
         omr_path = (
@@ -1701,7 +1885,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             else None
         )
         for index, block in enumerate(blocks):
-            if self.name_separator_page_var.get() and grouped_name_labels[index] is not None:
+            if include_names and grouped_name_labels[index] is not None:
                 jobs.append(
                     ResourceJob(
                         None,
@@ -1725,9 +1909,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                         pages_per_sheet=pages_per_sheet,
                         stapled=not separator_route,
                         label=item.name,
+                        dispatch_jobs=block.copies if block.bundled else 1,
                     )
                 )
-            if self.separator_page_var.get():
+            if include_separator:
                 jobs.append(
                     ResourceJob(
                         None,
@@ -1763,7 +1948,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         return snapshot.consumables
 
     def eta_print_rate_samples(self) -> tuple[float, ...]:
-        """Return only device-timed engine rates from the current schema."""
+        """Retain legacy scalar samples for config and callback compatibility."""
 
         raw_samples = self.device_monitor_config.get(ETA_PRINT_RATE_CONFIG_KEY, [])
         if not isinstance(raw_samples, list):
@@ -1778,18 +1963,42 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self,
         device_job: DeviceJob,
         sheet_count: int,
-    ) -> None:
+        *,
+        copies: int = 1,
+        duplex: bool = True,
+        previous_completed_at: datetime | None = None,
+    ) -> EtaTimingSample | None:
         """Learn print-engine speed without including printer queue wait."""
 
-        sample = completed_job_seconds_per_sheet(
+        if device_job.state != DeviceJobState.COMPLETED:
+            return None
+        if previous_completed_at is None and sheet_count < 20:
+            # A cold first short job is dominated by wake-up and preparation.
+            # It must not become the per-document cost for a whole warm run.
+            return None
+        timing = completed_job_timing(
             device_job.started_at,
             device_job.ended_at,
             sheet_count,
+            copies,
+            previous_completed_at=previous_completed_at,
+            duplex=duplex,
         )
-        if sample is None:
-            return
-        samples = [*self.eta_print_rate_samples(), sample]
-        self.device_monitor_config[ETA_PRINT_RATE_CONFIG_KEY] = samples[-ETA_SAMPLE_LIMIT:]
+        if timing is None:
+            return None
+        samples = [*self.eta_job_timing_samples(), timing][-ETA_TIMING_SAMPLE_LIMIT:]
+        self.device_monitor_config[ETA_TIMING_CONFIG_KEY] = [
+            {"sheets": item.sheets, "copies": item.copies, "seconds": item.seconds, "duplex": item.duplex}
+            for item in samples
+        ]
+        self.device_monitor_config[ETA_TIMING_DEVICE_KEY] = timing_device_key(str(self.device_monitor_config.get("base_url", "")))
+        return timing
+
+    def eta_job_timing_samples(self) -> tuple[EtaTimingSample, ...]:
+        config = getattr(self, "device_monitor_config", {})
+        if config.get(ETA_TIMING_DEVICE_KEY) != timing_device_key(str(config.get("base_url", ""))):
+            return ()
+        return validated_timing_samples(config.get(ETA_TIMING_CONFIG_KEY))
 
     def schedule_resource_estimate(self) -> None:
         """Queue the latest forecast behind print-critical PDF work."""
@@ -1815,18 +2024,25 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.resource_estimate_request_key = ("empty",)
             self.latest_resource_estimate = None
             self.latest_resource_estimate_key = None
+            self.resource_completion_projection = None
+            self.resource_completion_key = None
+            self.resource_completion_override = None
+            self.resource_completion_run_key = None
+            self.active_resource_eta = None
             self.set_resource_estimate_text("예상 자원  작업 큐 없음", "secondary")
             return
 
         consumables = self.resource_estimate_consumables()
         samples = self.eta_print_rate_samples()
+        timings = self.eta_job_timing_samples()
         paper_key = (
             tuple(consumables.a4_sources)
             if consumables is not None
             else ()
         )
         duplex = bool(self.duplex_var.get())
-        request_key = (jobs, paper_key, samples, duplex)
+        request_key = (jobs, paper_key, timings, duplex)
+        self.resource_estimate_duration_key = (jobs, timings, duplex)
         if request_key == getattr(self, "resource_estimate_request_key", None):
             return
 
@@ -1836,8 +2052,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         revision = getattr(self, "resource_estimate_revision", 0) + 1
         self.resource_estimate_revision = revision
         self.resource_estimate_request_key = request_key
+        self.resource_completion_run_key = None
         self.latest_resource_estimate = None
         self.latest_resource_estimate_key = None
+        self.active_resource_eta = None
+        self.resource_completion_override = None
         self.set_resource_estimate_text("예상 자원  계산 중", "secondary")
 
         def work() -> PrintResourceEstimate:
@@ -1847,6 +2066,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 duplex=duplex,
                 consumables=consumables,
                 verified_seconds_per_sheet=samples,
+                timing_samples=timings,
                 cancelled=lambda: (
                     revision != getattr(self, "resource_estimate_revision", -1)
                     or getattr(self, "is_closing", False)
@@ -1880,15 +2100,19 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             try:
                 estimate = future.result()
             except Exception as exc:
+                retain_run = getattr(self, "resource_completion_run_key", None) == (
+                    revision, getattr(self, "resource_estimate_request_key", None),
+                )
                 self.resource_estimate_request_key = None
                 self.latest_resource_estimate = None
                 self.latest_resource_estimate_key = None
-                self.set_resource_estimate_text("예상 자원  계산 실패", "warning")
+                if not retain_run:
+                    self.resource_completion_projection = None
+                    self.resource_completion_key = None
+                    self.set_resource_estimate_text("예상 자원  계산 실패", "warning")
                 self.log(f"인쇄 자원 예측 실패: {exc}")
             else:
-                self.latest_resource_estimate = estimate
-                self.latest_resource_estimate_key = self.resource_estimate_request_key
-                self.set_resource_estimate_text(estimate.display_text, estimate.tone)
+                self.adopt_resource_estimate(estimate, self.resource_estimate_request_key)
         current = getattr(self, "resource_estimate_future", None)
         if (
             not self.is_closing
@@ -1909,7 +2133,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             != getattr(self, "resource_estimate_request_key", None)
         ):
             return "\n\n예상 자원: 계산 결과를 아직 확인할 수 없습니다."
-        return f"\n\n{estimate.detail_text}"
+        return f"\n\n{self.resource_estimate_detail_text()}"
 
     def complete_resource_estimate_for_confirmation(self, timeout: float = 15.0) -> None:
         """Finish the already scheduled forecast before the final print prompt."""
@@ -1936,9 +2160,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             or request_key != getattr(self, "resource_estimate_request_key", None)
         ):
             return
-        self.latest_resource_estimate = estimate
-        self.latest_resource_estimate_key = request_key
-        self.set_resource_estimate_text(estimate.display_text, estimate.tone)
+        self.adopt_resource_estimate(estimate, request_key)
 
     def refresh_toggle_buttons(self) -> None:
         for button, text, variable in self.toggle_buttons:
@@ -1948,13 +2170,14 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             label = "양면" if text == "양면 인쇄" else text
             button.configure(
                 text=f"{marker} {label} {state_text}",
-                bg=self.colors["success"] if enabled else self.colors["panel_soft"],
-                fg="#ffffff" if enabled else self.colors["muted"],
-                activebackground=self.colors["link"] if enabled else "#eef2f7",
-                activeforeground="#ffffff" if enabled else self.colors["text"],
-                highlightbackground=self.colors["success"] if enabled else self.colors["border"],
-                highlightcolor=self.colors["success"] if enabled else self.colors["border"],
-                highlightthickness=2 if enabled else 1,
+                bg=self.colors["accent"] if enabled else self.colors["panel_soft"],
+                fg=self.colors["on_accent"] if enabled else self.colors["muted"],
+                activebackground=self.colors["accent_hover"] if enabled else self.colors["hover"],
+                activeforeground=self.colors["on_accent"] if enabled else self.colors["text"],
+                disabledforeground=self.colors["disabled_fg"],
+                highlightbackground=self.colors["accent"] if enabled else self.colors["border"],
+                highlightcolor=self.colors["focus"],
+                highlightthickness=2,
                 relief="solid",
             )
 
@@ -2507,6 +2730,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         style.map("SoftAction.TButton", background=[("active", colors["accent_soft"]), ("pressed", "#d7e7f2")])
         style.configure("DangerAction.TButton", padding=(9, 5), background=colors["danger_soft"], foreground=colors["danger"], borderwidth=0, font=(family, 10, "bold"))
         style.map("DangerAction.TButton", background=[("active", "#f5dcd8"), ("pressed", "#efc7c1")])
+        apply_workbench_styles(style, family)
+        # Entry-family controls own their font option; ttk's style font alone
+        # does not replace TkTextFont. Set it before constructing the fields.
+        for widget_class in ("TEntry", "TCombobox", "TSpinbox"):
+            self.root.option_add(f"*{widget_class}.font", (family, 11))
+        self.root.option_add("*TCombobox*Listbox.font", f"{{{family}}} 11")
 
     @staticmethod
     def name_entry_window_handle(widget: tk.Misc) -> int:
@@ -2982,7 +3211,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0)
         )
         self.bind_block_add_button(add_unit_button, self.add_current_block)
-        ttk.Label(builder, textvariable=self.builder_status_var, style="SectionHint.TLabel", wraplength=390).grid(
+        korean_label(builder, textvariable=self.builder_status_var, style="SectionHint.TLabel", wraplength=390).grid(
             row=10, column=0, columnspan=4, sticky="w", pady=(14, 0)
         )
         self.unit_selected_numbers_entry.bind("<KeyRelease>", lambda _event: self.update_builder_status(), add="+")
@@ -3222,7 +3451,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.order_csv_list.configure(yscrollcommand=order_csv_scroll.set)
         self.order_csv_list.grid(row=0, column=0, sticky="nsew")
         order_csv_scroll.grid(row=0, column=1, sticky="ns")
-        ttk.Label(
+        korean_label(
             order_builder,
             textvariable=self.order_csv_status_var,
             style="SectionHint.TLabel",
@@ -3509,7 +3738,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             state="disabled",
         )
         self.cancel_print_button.pack(side="left", padx=(0, 7))
-        ttk.Button(footer_actions, text="인쇄 시작", style="Primary.TButton", command=self.start_print_thread).pack(side="left")
+        self.start_print_button = ttk.Button(
+            footer_actions, text="인쇄 시작", width=10,
+            style="Primary.TButton", command=self.start_print_thread,
+        )
+        self.start_print_button.pack(side="left")
 
         self.subject_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_levels())
         self.level_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_rounds())
@@ -3657,7 +3890,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             add_button,
             lambda current_kind=kind: self.add_test_catalog_block(current_kind),
         )
-        ttk.Label(
+        korean_label(
             page,
             textvariable=variables["status"],
             style="SectionHint.TLabel",
@@ -4024,7 +4257,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         )
         add_button.grid(row=0, column=2, sticky="e")
         self.bind_block_add_button(add_button, self.add_apex_material_block)
-        status_label = ttk.Label(
+        status_label = korean_label(
             page,
             textvariable=self.apex_status_var,
             style="InsetText.TLabel",
@@ -4258,7 +4491,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         setattr(self, f"{prefix}_add_button", add_button)
         self.bind_block_add_button(add_button, add_command)
 
-        status_label = ttk.Label(
+        status_label = korean_label(
             parent,
             textvariable=getattr(self, f"{prefix}_status_var"),
             style="InsetText.TLabel",
@@ -4342,7 +4575,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.add_gyopyeong_material_block,
         )
 
-        self.gyopyeong_status_label = ttk.Label(
+        self.gyopyeong_status_label = korean_label(
             parent,
             textvariable=self.gyopyeong_status_var,
             style="InsetText.TLabel",
@@ -4440,7 +4673,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.add_selected_exam_material_block,
         )
 
-        self.selected_exam_status_label = ttk.Label(
+        self.selected_exam_status_label = korean_label(
             parent,
             textvariable=self.selected_exam_status_var,
             style="InsetText.TLabel",
@@ -4529,7 +4762,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.bind_block_add_button(
             self.textbook_add_button, self.add_textbook_material_block
         )
-        self.textbook_status_label = ttk.Label(
+        self.textbook_status_label = korean_label(
             parent,
             textvariable=self.textbook_status_var,
             style="InsetText.TLabel",
@@ -4613,7 +4846,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.bind_block_add_button(
             self.textbook_variant_add_button, self.add_textbook_variant_block
         )
-        self.textbook_variant_status_label = ttk.Label(
+        self.textbook_variant_status_label = korean_label(
             parent, textvariable=self.textbook_variant_status_var,
             style="InsetText.TLabel", justify="left", wraplength=380,
         )
@@ -4711,7 +4944,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.able_add_button = add_able_button
         add_able_button.grid(row=0, column=2, sticky="e")
         self.bind_block_add_button(add_able_button, self.add_able_material_block)
-        self.able_status_label = ttk.Label(
+        self.able_status_label = korean_label(
             able, textvariable=self.able_status_var, style="InsetText.TLabel", justify="left", wraplength=380
         )
         self.able_status_label.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 0))
@@ -6664,6 +6897,14 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             )
 
     def close_pdf_work_services(self) -> None:
+        self.cancel_source_paths_open()
+        self.cancel_pending_print_preparation(restore=False)
+        print_preparation_worker = getattr(self, "_print_preparation_worker", None)
+        if print_preparation_worker is not None:
+            print_preparation_worker.close()
+        cancel_preview = getattr(self, "cancel_preview_render", None)
+        if cancel_preview is not None:
+            cancel_preview()
         after_id = getattr(self, "background_build_poll_after_id", None)
         if after_id is not None:
             try:
@@ -6799,10 +7040,69 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.shortcut_help_var.set(message)
 
     def handle_editor_variable_change(self, *_args: object) -> None:
-        if self.editor_syncing or self.keyboard_state.zone is not KeyboardZone.QUEUE_EDITOR:
+        if self.editor_syncing or getattr(self, "editor_block", None) is None:
             return
-        self.keyboard_state.editor_dirty = True
+        self.keyboard_state.editor_dirty = self.queue_editor_values() != self.editor_baseline
         self.refresh_editor_status()
+
+    def queue_editor_values(self) -> tuple[str, ...]:
+        # Read raw Tcl values so a temporarily blank/invalid IntVar remains a
+        # draft. Typed validation belongs to saving, not the variable trace.
+        return tuple(
+            str(tk.Variable.get(variable) if isinstance(variable, tk.Variable) else variable.get())
+            for name in QUEUE_EDITOR_VARIABLE_NAMES
+            if (variable := getattr(self, name, None)) is not None
+        )
+
+    def take_queue_editor_ime(self) -> None:
+        if getattr(self, "editor_block", None) is None:
+            return
+        try:
+            widget = self.root.focus_get()
+        except (AttributeError, tk.TclError, KeyError):
+            return
+        if widget is not None and self.widget_is_in_queue_editor(widget):
+            self.take_name_entry_ime(widget)
+
+    def save_pending_queue_editor(self) -> bool:
+        """Commit the bound draft before navigation; never save into its target."""
+        if getattr(self, "editor_save_in_progress", False):
+            return False
+        state = getattr(self, "keyboard_state", None)
+        if state is None:
+            return True
+        bound_block = getattr(self, "editor_block", None)
+        self.editor_save_in_progress = True
+        try:
+            # Capture Hangul preedit before the cursor or keyboard zone moves.
+            self.take_queue_editor_ime()
+            if not state.editor_dirty:
+                return True
+            index = self.selected_block_index()
+            if bound_block is not None and (index is None or self.blocks[index] is not bound_block):
+                self.queue_status_var.set("편집 중인 블록이 변경되었습니다. Esc로 다시 불러와 주세요.")
+                return False
+            if not self.replace_selected_block_from_editor():
+                self.queue_status_var.set("수정 저장 실패 · 입력을 고치거나 Esc로 취소해 주세요.")
+                self.focus_queue_editor()
+                return False
+            state.editor_dirty = False
+            self.refresh_editor_status()
+            return True
+        finally:
+            self.editor_save_in_progress = False
+
+    def save_queue_editor_before_selection(self, focus: int | None, indices: set[int]) -> bool:
+        self.take_queue_editor_ime()
+        bound_block = getattr(self, "editor_block", None)
+        target = self.blocks[focus] if focus is not None else None
+        current = self.selected_block_index()
+        if (
+            target is not bound_block
+            or (current in self.selected_block_indices and current not in indices)
+        ):
+            return self.save_pending_queue_editor()
+        return True
 
     def refresh_editor_status(self) -> None:
         label = getattr(self, "queue_edit_status_label", None)
@@ -7005,6 +7305,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 lambda target=widget: self.activate_default_korean_input(target),
             )
         if widget is getattr(self, "custom_drop_list", None):
+            if not self.save_pending_queue_editor():
+                return
             self.set_active_workspace("builder")
             self.keyboard_state.enter_pdf_list()
             self.refresh_shortcut_help()
@@ -7016,6 +7318,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.keyboard_state.enter_queue(cursor=self.selected_block_index())
             self.set_active_workspace("queue")
         elif self.widget_is_in_builder(widget):
+            if not self.save_pending_queue_editor():
+                return
             self.keyboard_state.enter_builder(tab=self.builder_notebook.index("current"))
             if self.keyboard_state.builder_tab == 0:
                 self.keyboard_state.test_tab = self.test_tabs.index("current")
@@ -7055,6 +7359,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             return
         self.clear_taskbar_completion_notification()
         if widget is getattr(self, "custom_drop_list", None):
+            if not self.save_pending_queue_editor():
+                return
             self.set_active_workspace("builder")
             self.keyboard_state.enter_pdf_list()
             self.refresh_shortcut_help()
@@ -7066,6 +7372,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.keyboard_state.enter_queue(cursor=self.selected_block_index())
             self.set_active_workspace("queue")
         elif self.widget_is_in_builder(widget):
+            if not self.save_pending_queue_editor():
+                return
             self.keyboard_state.enter_builder(tab=self.builder_notebook.index("current"))
             if self.keyboard_state.builder_tab == 0:
                 self.keyboard_state.test_tab = self.test_tabs.index("current")
@@ -7732,6 +8040,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         return "break"
 
     def focus_builder_area(self) -> str:
+        if not self.save_pending_queue_editor():
+            return "break"
         widgets = self.builder_focus_widgets()
         self.set_active_workspace("builder")
         if widgets:
@@ -7814,8 +8124,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         return "break"
 
     def handle_workspace_cycle(self, event: tk.Event) -> str:
-        if self.keyboard_state.editor_dirty:
-            self.queue_status_var.set("Enter로 수정 저장하거나 Esc로 취소한 뒤 이동하세요.")
+        if not self.save_pending_queue_editor():
             return "break"
         if self.material_dropdown_widget is not None:
             self.close_keyboard_popup()
@@ -8141,27 +8450,35 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         focus_index: int | None = None,
         anchor_index: int | None = None,
         load_form: bool = False,
-    ) -> None:
+    ) -> bool:
         valid = {index for index in indices if 0 <= index < len(self.blocks)}
         focus = focus_index if focus_index is not None and 0 <= focus_index < len(self.blocks) else (min(valid) if valid else None)
+        if not self.save_queue_editor_before_selection(focus, valid):
+            return False
         self.selected_block_indices = valid
         self.selected_block_index_value = focus
         self.queue_selection_anchor = anchor_index if anchor_index in range(len(self.blocks)) else focus
         self.keyboard_state.queue_cursor = focus
         self.keyboard_state.mark_keyboard_activity()
-        self.refresh_queue_selection()
+        # Loading the builder also populates the editor. Avoid filling it twice
+        # for a click while retaining the ordinary keyboard-only refresh path.
+        if load_form and focus is not None:
+            self.refresh_queue_selection(update_editor=False)
+        else:
+            self.refresh_queue_selection()
         if load_form:
             self.load_selected_block_to_form()
+        return True
 
-    def select_queue_with_modifiers(self, index: int, state: int) -> None:
+    def select_queue_with_modifiers(self, index: int, state: int) -> bool:
         if not 0 <= index < len(self.blocks):
-            return
+            return False
         selection = queue_click_selection(
             len(self.blocks), self.selected_block_indices, self.selected_block_index(),
             self.queue_selection_anchor, index,
             control=bool(state & 0x0004), shift=bool(state & 0x0001),
         )
-        self.select_queue_indices(
+        return self.select_queue_indices(
             set(selection.selected_indices), focus_index=selection.focus_index,
             anchor_index=selection.anchor_index, load_form=True,
         )
@@ -8177,6 +8494,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         indices = [index for index in indices if 0 <= index < len(self.blocks)]
         if not indices:
             self.queue_status_var.set("복사할 블록을 선택하세요.")
+            return "break"
+        if not self.save_pending_queue_editor():
             return "break"
         self.block_clipboard = tuple(
             replace(self.blocks[index], files=list(self.blocks[index].files))
@@ -8201,6 +8520,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if not copied_blocks:
             self.queue_status_var.set("먼저 작업 큐에서 블록을 복사하세요.")
             return "break"
+        if not self.save_pending_queue_editor():
+            return "break"
         selected_indices = sorted(
             index for index in self.selected_block_indices
             if 0 <= index < len(self.blocks)
@@ -8220,6 +8541,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ]
 
         def commit() -> None:
+            anchor_index = next(
+                (index for index, block in enumerate(self.blocks) if block is anchor_block), None,
+            )
+            if not self.save_pending_queue_editor():
+                return
+            current_anchor = self.blocks[anchor_index] if anchor_index is not None else anchor_block
             self.push_undo_state("블록 붙여넣기")
             first_index = len(self.blocks)
             current_retry = getattr(self, "retry_batch", None)
@@ -8227,9 +8554,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 append_only or self.is_printing
                 or bool(current_retry is not None and current_retry.jobs)
             )
-            if not must_append and anchor_block is not None:
+            if not must_append and current_anchor is not None:
                 first_index = next(
-                    (index + 1 for index, block in enumerate(self.blocks) if block is anchor_block),
+                    (index + 1 for index, block in enumerate(self.blocks) if block is current_anchor),
                     first_index,
                 )
             self.blocks[first_index:first_index] = pasted_blocks
@@ -8264,10 +8591,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.queue_selection_anchor, target,
             control=bool(event.state & 0x0004), shift=bool(event.state & 0x0001),
         )
-        self.select_queue_indices(
+        if not self.select_queue_indices(
             set(selection.selected_indices), focus_index=selection.focus_index,
             anchor_index=selection.anchor_index,
-        )
+        ):
+            return "break"
         self.focus_queue_canvas()
         return "break"
 
@@ -8555,6 +8883,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
     def handle_queue_command_shortcut(self, event: tk.Event, command: Callable) -> str | None:
         if not self.widget_is_in_queue(event.widget) or self.widget_is_in_queue_editor(event.widget) or self.shortcut_focus_is_editor(event):
             return None
+        if not self.save_pending_queue_editor():
+            return "break"
         command()
         return "break"
 
@@ -8616,7 +8946,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             return "break"
         if self.keyboard_state.zone is KeyboardZone.QUEUE_EDITOR or self.widget_is_in_queue_editor(event.widget):
             if self.keyboard_state.editor_dirty:
-                self.populate_queue_editor(self.selected_block_index())
+                self.populate_queue_editor(self.selected_block_index(), discard_draft=True)
             self.keyboard_state.editor_dirty = False
             self.focus_queue_canvas()
             self.refresh_editor_status()
@@ -9535,17 +9865,22 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             )
             content.pack(fill="both", expand=True)
             self.persistent_alert_title_var = StringVar()
-            tk.Label(
+            korean_label(
                 content,
+                native=True,
+                mode="balance",
                 textvariable=self.persistent_alert_title_var,
                 bg=self.colors["panel"],
                 fg=self.colors["text"],
                 font=(self.ui_font_family, 13, "bold"),
                 anchor="w",
+                justify="left",
+                wraplength=408,
             ).pack(fill="x")
             self.persistent_alert_message_var = StringVar()
-            tk.Label(
+            korean_label(
                 content,
+                native=True,
                 textvariable=self.persistent_alert_message_var,
                 bg=self.colors["panel"],
                 fg=self.colors["muted"],
@@ -9577,12 +9912,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.persistent_alert_message_var.set(spec.message)
         palette = {
             "danger": self.colors["danger"],
-            "warning": self.colors["warning"],
-            "success": self.colors["accent"],
+            "warning": self.colors["danger"],
+            "success": self.colors["complete"],
         }
         accent = palette.get(
             spec.tone,
-            self.colors["accent"],
+            self.colors["complete"],
         )
         if self.persistent_alert_accent_bar is not None:
             self.persistent_alert_accent_bar.configure(bg=accent)
@@ -9593,7 +9928,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             resume_button.pack_forget()
             confirm_button.pack_forget()
             confirm_button.configure(
-                style="SoftAction.TButton" if spec.allow_resume else "Primary.TButton"
+                style=("SoftAction.TButton" if spec.allow_resume else (
+                    "Completion.TButton" if spec.tone == "success" else "Primary.TButton"
+                ))
             )
             confirm_button.pack(side="right")
             if spec.allow_resume:
@@ -9879,6 +10216,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.log(f"작업 표시줄 상태 갱신 실패: {exc}")
 
     def update_taskbar_from_status(self, message: str) -> None:
+        self.update_resource_completion_status(message)
         if message == "실제 인쇄 완료":
             self.set_taskbar_display_state("complete", completion_basis="device")
         elif message == "전송 완료 / 인쇄 완료":
@@ -10069,6 +10407,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
     def poll_device_status(self) -> None:
         if self.is_closing:
             return
+        self.refresh_resource_completion_clock()
         monitor = self.device_monitor
         if monitor is not None:
             snapshot = monitor.latest_snapshot
@@ -10276,18 +10615,33 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.refresh_print_action_buttons()
 
     def refresh_print_action_buttons(self) -> None:
+        preparing = getattr(self, "_print_preparation_request", None) is not None
+        start_button = getattr(self, "start_print_button", None)
+        if start_button is not None:
+            active = self.is_printing or preparing
+            flags = set(start_button.state())
+            changes = []
+            if ("alternate" in flags) != active:
+                changes.append("alternate" if active else "!alternate")
+            if ("disabled" in flags) != preparing:
+                changes.append("disabled" if preparing else "!disabled")
+            if changes:
+                start_button.state(changes)
+            label = "준비 중" if preparing else "인쇄 중" if self.is_printing else "인쇄 시작"
+            if str(start_button.cget("text")) != label:
+                start_button.configure(text=label)
         retry_button = getattr(self, "retry_button", None)
         if retry_button is not None:
             target_state = (
                 "normal"
-                if self.retry_batch is not None and not self.is_printing
+                if self.retry_batch is not None and not self.is_printing and not preparing
                 else "disabled"
             )
             if str(retry_button.cget("state")) != target_state:
                 retry_button.configure(state=target_state)
         cancel_button = getattr(self, "cancel_print_button", None)
         if cancel_button is not None:
-            can_cancel = self.is_printing and not self.print_cancel_event.is_set()
+            can_cancel = preparing or (self.is_printing and not self.print_cancel_event.is_set())
             target_state = "normal" if can_cancel else "disabled"
             if str(cancel_button.cget("state")) != target_state:
                 cancel_button.configure(state=target_state)
@@ -10303,6 +10657,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.refresh_print_action_buttons()
 
     def cancel_current_print(self) -> None:
+        if self.cancel_pending_print_preparation() and not self.is_printing:
+            self.queue_status_var.set("인쇄 준비를 취소했습니다.")
+            return
         if not self.is_printing or self.print_cancel_event.is_set():
             return
         confirmed = messagebox.askyesno(
@@ -10323,6 +10680,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             return
         if not self.is_printing:
             self.is_closing = True
+            self.cancel_source_paths_open()
             self.close_persistent_operator_alert(reset_dismissal=True)
             if self.device_monitor is not None:
                 self.device_monitor.stop()
@@ -10342,6 +10700,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if not confirmed:
             return
         self.is_closing = True
+        self.cancel_source_paths_open()
         self.cancel_pending_block_preparations()
         self.print_cancel_event.set()
         self.set_status("종료 준비 중")
@@ -10392,80 +10751,28 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.root.after(0, self.refresh_retry_button)
 
     def retry_remaining_jobs(self) -> None:
+        if getattr(self, "_print_preparation_request", None) is not None:
+            return
         if getattr(self, "group_build_pending", False):
             self.queue_status_var.set("묶음 준비가 끝난 뒤 인쇄를 시작해 주세요.")
             return
         if self.is_printing:
             messagebox.showinfo(APP_TITLE, "현재 인쇄 전송이 끝난 뒤에 재시도할 수 있습니다.")
             return
-        self.sync_retry_queue()
         retry_batch = self.retry_batch
+        if retry_batch is not None:
+            visible_uids = {id(block) for block in self.blocks}
+            retained_jobs = tuple(job for job in retry_batch.jobs if job.block_uid in visible_uids)
+            if len(retained_jobs) != len(retry_batch.jobs):
+                retry_batch = replace(retry_batch, jobs=retained_jobs) if retained_jobs else None
+                self.retry_batch = retry_batch
         if retry_batch is None:
+            self.refresh_retry_button()
             messagebox.showinfo(APP_TITLE, "재시도할 남은 작업이 없습니다.")
             return
-        try:
-            self.validate_print_jobs(list(retry_batch.jobs))
-            run_options = self.current_print_run_options()
-            self.ensure_device_monitor_ready_for_print(run_options)
-            if not run_options.dry_run:
-                self.ensure_orientation_profiles_ready(run_options.printer_name)
-                self.ensure_job_printers_ready(list(retry_batch.jobs))
-                if run_options.engine != "sumatra":
-                    raise RuntimeError("방향별 스테이플 인쇄는 SumatraPDF 방식에서만 지원합니다.")
-                run_options = self.ensure_device_printer_binding(run_options, jobs=list(retry_batch.jobs))
-        except Exception as error:
-            messagebox.showwarning(APP_TITLE, str(error))
-            return
-        if not run_options.dry_run:
-            self.complete_resource_estimate_for_confirmation()
-        if not run_options.dry_run and not messagebox.askyesno(
-            APP_TITLE,
-            f"멈춘 지점부터 남은 {len(retry_batch.jobs)}건만 다시 전송할까요?\n\n"
-            "이미 전송 확인된 작업은 제외됩니다."
-            f"{self.resource_estimate_confirmation_text()}",
-        ):
-            return
-        try:
-            self.begin_history_run(run_options, retry=True)
-        except HistoryWriteError as error:
-            messagebox.showwarning(APP_TITLE, str(error))
-            return
-        retry_block_uids = {job.block_uid for job in retry_batch.jobs}
-        retry_blocks = [block for block in self.blocks if id(block) in retry_block_uids]
-        with self.print_state_lock:
-            self.print_pending_jobs = list(retry_batch.jobs)
-            self.print_scheduled_block_ids = retry_block_uids
-            self.print_started_block_ids = set()
-            self.print_next_block_index = max((job.block_index for job in retry_batch.jobs), default=0) + 1
-            self.print_include_separator_pages = retry_batch.include_separator_pages or any(
-                job.is_separator and not job.is_name_separator for job in retry_batch.jobs
-            )
-            self.print_include_name_separator_pages = (
-                retry_batch.include_name_separator_pages
-                or any(job.is_name_separator for job in retry_batch.jobs)
-            )
-            self.print_last_name_separator_label = self.trailing_name_separator_label(
-                retry_blocks,
-                retry_batch.preceding_name_separator_label,
-            ) if self.print_include_name_separator_pages else ""
-            self.print_queue_revision = getattr(self, "print_queue_revision", 0) + 1
-            self.print_accepting_appends = True
-            self.active_print_block_uid = None
-            self.print_run_options = run_options
-        self.retry_batch = None
-        self.undo_stack = []
-        self.redo_stack = []
-        self.begin_taskbar_print_run(len(self.print_pending_jobs))
-        self.mark_blocks_status(retry_blocks, "예약")
-        self.print_cancel_event.clear()
-        self.is_printing = True
-        self.refresh_print_action_buttons()
-        self.print_thread = threading.Thread(
-            target=self.print_blocks,
-            args=(retry_blocks, run_options),
-            daemon=True,
-        )
-        self.print_thread.start()
+        retry_uids = {job.block_uid for job in retry_batch.jobs}
+        blocks = [block for block in self.blocks if id(block) in retry_uids]
+        self.begin_print_preparation("retry", blocks, retry_batch=retry_batch)
 
     def queue_block_status(self, block: PrintBlock) -> str:
         return self.block_status_by_id.get(id(block), "대기")
@@ -10550,12 +10857,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
     def queue_status_colors(self, status: str) -> tuple[str, str, str]:
         if status in {"진행 중", "전송 중"}:
-            return self.colors["accent_soft"], self.colors["link"], self.colors["link"]
-        if status == "완료":
             return self.colors["success_soft"], self.colors["success"], self.colors["success"]
-        if status in {"추가됨", "예약"}:
+        if status == "완료":
+            return self.colors["complete_soft"], self.colors["complete"], self.colors["complete"]
+        if status in {"대기", "추가됨", "예약"}:
             return self.colors["warning_soft"], self.colors["warning"], self.colors["warning"]
-        if status in {"오류", "중지됨"}:
+        if status in {"오류", "경고", "중지됨"}:
             return self.colors["danger_soft"], self.colors["danger"], self.colors["danger"]
         return self.colors["panel_soft"], self.colors["muted"], self.colors["border_soft"]
 
@@ -10854,15 +11161,19 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self,
         printer_name: str | None = None,
         available_printers: frozenset[str] | None = None,
+        *,
+        update_status: bool = True,
     ) -> None:
         profiles = derive_profile_names(printer_name or self.printer_var.get())
         available = available_printers if available_printers is not None else frozenset(load_printers())
         missing = tuple(queue_name for queue_name in profiles.profile_queues if queue_name not in available)
         if missing:
             missing_text = "\n".join(f"- {queue_name}" for queue_name in missing)
-            self.profile_status_var.set("방향 프로필: 설정 필요")
+            if update_status:
+                self.profile_status_var.set("방향 프로필: 설정 필요")
             raise RuntimeError(f"방향별 전용 프린터 프로필을 먼저 준비해 주세요.\n{missing_text}")
-        self.profile_status_var.set("프린터 프로필: 모두 사용")
+        if update_status:
+            self.profile_status_var.set("프린터 프로필: 모두 사용")
 
     def cached_printer_inventory(self) -> frozenset[str]:
         now = time.monotonic()
@@ -10974,13 +11285,19 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         jobs: list[PrintJob] | None = None,
         include_separator_pages: bool = False,
         include_name_separator_pages: bool = False,
+        monitor_base_url: str | None = None,
     ) -> PrintRunOptions:
         if run_options.dry_run or not run_options.device_completion_mode:
             return run_options
-        monitor = self.device_monitor
-        if monitor is None:
-            raise RuntimeError("프린터 상태 연결이 없습니다.")
-        base_url = str(monitor.client.base_url).strip().rstrip("/")
+        if monitor_base_url is None:
+            monitor = self.device_monitor
+            if monitor is None:
+                raise RuntimeError("프린터 상태 연결이 없습니다.")
+            base_url = str(monitor.client.base_url).strip().rstrip("/")
+        else:
+            base_url = monitor_base_url
+            if not base_url:
+                raise RuntimeError("프린터 상태 연결이 없습니다.")
         if run_options.device_monitor_base_url and run_options.device_monitor_base_url != base_url:
             raise RuntimeError("인쇄 실행 중 프린터 상태 연결이 변경됐습니다. 기존 작업의 완료를 확인한 뒤 다시 시작해 주세요.")
         if jobs is not None:
@@ -11516,6 +11833,33 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             block.name_separator_label = name_separator_label
             return block
 
+        baseline = getattr(self, "editor_baseline", None)
+        if (
+            selected_block is not None
+            and selected_block is getattr(self, "editor_block", None)
+            and baseline is not None
+            and self.queue_editor_values()[:6] == baseline[:6]
+        ):
+            # Metadata-only saves must not rebuild a selected textbook/APEX
+            # range PDF or discard its existing routing/composition metadata.
+            fixed_form = selected_block.source in FIXED_FORM_SOURCES
+            route, override = selected_block.printer_route, selected_block.printer_override
+            if selected_block.source == "custom" and selected_block.material_kind != "queue_bundle":
+                route, override = self.resolve_block_printer_route(self.edit_printer_route_var.get())
+            return replace(
+                selected_block,
+                files=list(selected_block.files),
+                copies=copies,
+                bundled=False if fixed_form else (
+                    True if selected_block.material_kind == "queue_bundle" else self.edit_bundle_var.get()
+                ),
+                name_separator_label="" if fixed_form else name_separator_label,
+                printer_route=route,
+                printer_override=override,
+                history_id=str(uuid.uuid4()),
+                replaces_block_id="",
+            )
+
         if selected_block is not None and selected_block.source in FIXED_FORM_SOURCES:
             fixed_route = "가로" if selected_block.source == "omr" else "세로"
             printer_route, printer_override = self.resolve_block_printer_route(fixed_route)
@@ -11639,7 +11983,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 level=selected_block.level,
                 round_name=selected_block.round_name,
                 start=1,
-                end=1,
+                end=len(selected_block.files),
                 copies=copies,
                 files=list(selected_block.files),
                 bundled=True,
@@ -11782,11 +12126,24 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.update_queue_view()
         self.update_preview()
 
-    def populate_queue_editor(self, index: int | None = None) -> None:
+    def populate_queue_editor(self, index: int | None = None, *, discard_draft: bool = False) -> None:
         """Load a queue block without turning programmatic updates into edits."""
+        if index is None:
+            index = self.selected_block_index()
+        block = self.blocks[index] if index is not None and 0 <= index < len(self.blocks) else None
+        if (
+            not discard_draft
+            and block is not None
+            and block is getattr(self, "editor_block", None)
+            and self.keyboard_state.editor_dirty
+        ):
+            self.refresh_editor_status()
+            return
         self.editor_syncing = True
         try:
             self._populate_queue_editor(index)
+            self.editor_block = block
+            self.editor_baseline = self.queue_editor_values()
         finally:
             self.editor_syncing = False
         self.keyboard_state.editor_dirty = False
@@ -12009,9 +12366,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.refresh_toggle_buttons()
             return
         self.edit_subject_var.set(block.subject)
-        self.refresh_edit_levels()
+        self.edit_level_combo["values"] = (
+            catalog_levels(self.catalog, block.subject)
+            if self.catalog else scan_levels(self.root_path, block.subject)
+        )
         self.edit_level_var.set(block.level)
-        self.refresh_edit_rounds()
+        self.edit_round_combo["values"] = (
+            catalog_rounds(self.catalog, block.subject, block.level)
+            if self.catalog else scan_rounds(self.root_path, block.subject, block.level)
+        )
         self.edit_round_var.set(block.round_name)
         self.refresh_edit_files()
         self.edit_selected_numbers_label.configure(text="개별 파일")
@@ -12073,10 +12436,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             return None
         return index
 
-    def select_queue_index(self, index: int, *, load_form: bool = False) -> None:
+    def select_queue_index(self, index: int, *, load_form: bool = False) -> bool:
         if not 0 <= index < len(self.blocks):
-            return
-        self.select_queue_indices({index}, focus_index=index, anchor_index=index, load_form=load_form)
+            return False
+        return self.select_queue_indices({index}, focus_index=index, anchor_index=index, load_form=load_form)
 
     def commit_selected_block_replacement(self, block: PrintBlock, source: str) -> bool:
         index = self.selected_block_index()
@@ -12111,7 +12474,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.blocks[index] = block
         self.block_status_by_id[id(block)] = "대기"
         self.sync_retry_queue()
-        self.update_queue_view(select_index=index)
+        self.update_queue_view(
+            select_index=None if getattr(self, "editor_save_in_progress", False) else index
+        )
         self.update_preview()
         self.log(f"블록 수정 저장({source}): {index + 1}. {block.summary}")
         return True
@@ -12161,9 +12526,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.populate_queue_editor(index)
             return
         self.subject_var.set(block.subject)
-        self.refresh_levels()
+        self.level_combo["values"] = (
+            catalog_levels(self.catalog, block.subject)
+            if self.catalog else scan_levels(self.root_path, block.subject)
+        )
         self.level_var.set(block.level)
-        self.refresh_rounds()
+        self.round_combo["values"] = (
+            catalog_rounds(self.catalog, block.subject, block.level)
+            if self.catalog else scan_rounds(self.root_path, block.subject, block.level)
+        )
         self.round_var.set(block.round_name)
         self.refresh_files()
         self.start_var.set(self.label_for_number(block.start))
@@ -12211,6 +12582,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             messagebox.showwarning(APP_TITLE, "인쇄 중이거나 재시도할 작업이 있으면 순서를 변경할 수 없습니다.")
             return
         if len(self.blocks) < 2:
+            return
+        if not self.save_pending_queue_editor():
             return
         sorted_blocks = sorted(self.blocks, key=lambda block: name_separator_order_key(block.name_separator_label))
         if all(before is after for before, after in zip(self.blocks, sorted_blocks)):
@@ -12366,14 +12739,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.schedule_queue_recovery_save()
 
     def queue_recovery_snapshot(self, reason: str) -> dict[str, object]:
+        from unit_print_queue_recovery import snapshot_print_block
+
         now = datetime.now().astimezone().isoformat(timespec="milliseconds")
         entries = []
         for block in self.blocks:
-            data = asdict(block)
-            for item in data["files"]:
-                item["path"] = str(item["path"])
-            if data["selected_numbers"] is not None:
-                data["selected_numbers"] = list(data["selected_numbers"])
+            data = snapshot_print_block(block)
             state = self.block_status_by_id.get(id(block), "대기")
             risk = "unsent" if state in {"대기", "예약", "추가됨"} else "submitted" if state == "완료" else "uncertain"
             entries.append({"block": data, "state": state,
@@ -12391,7 +12762,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if writer is None or not self.blocks:
             return
         try:
-            writer.submit(self.queue_recovery_snapshot(reason))
+            writer.submit_captured(self.queue_recovery_snapshot(reason))
         except Exception as error:
             self.report_queue_recovery_error(error)
             return
@@ -12500,7 +12871,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         table.configure(yscrollcommand=scroll.set)
         table.tag_configure("held", foreground=self.colors["muted_soft"])
         status = StringVar(value="백업 확인 중…")
-        ttk.Label(frame, textvariable=status, style="SectionHint.TLabel", wraplength=820).grid(row=4, column=0, sticky="ew", pady=10)
+        korean_label(frame, textvariable=status, style="SectionHint.TLabel", wraplength=820).grid(row=4, column=0, sticky="ew", pady=10)
         buttons = ttk.Frame(frame, style="Surface.TFrame")
         buttons.grid(row=5, column=0, sticky="e")
         ttk.Button(buttons, text="닫기", style="SoftAction.TButton", command=window.destroy).pack(side="left", padx=(0, 8))
@@ -12637,9 +13008,18 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.log(f"작업 큐 복구: 미전송 블록 {len(restored)}개 · 인쇄는 시작하지 않았습니다.")
         return True
 
-    def refresh_queue_selection(self, select_index: int | None = None) -> None:
+    def refresh_queue_selection(
+        self, select_index: int | None = None, *, update_editor: bool = True,
+    ) -> None:
         """Refresh cursor/selection without treating navigation as a queue edit."""
         if select_index is not None and 0 <= select_index < len(self.blocks):
+            if (
+                not getattr(self, "editor_save_in_progress", False)
+                and select_index != self.selected_block_index_value
+                and not self.save_queue_editor_before_selection(select_index, {select_index})
+            ):
+                self.draw_queue()
+                return
             self.selected_block_index_value = select_index
             self.selected_block_indices = {select_index}
             self.queue_selection_anchor = select_index
@@ -12670,7 +13050,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.keyboard_state.queue_cursor = self.selected_block_index_value
 
         self.draw_queue()
-        self.populate_queue_editor(self.selected_block_index_value)
+        if update_editor:
+            self.populate_queue_editor(self.selected_block_index_value)
 
     def on_queue_canvas_configure(self, _event: tk.Event) -> None:
         self.request_queue_redraw()
@@ -12752,7 +13133,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 pad,
                 width - pad,
                 max(bottom, pad + 120),
-                radius=14,
+                radius=QUEUE_CARD_RADIUS,
                 fill=colors["panel"],
                 outline=colors["border_soft"],
                 width=1,
@@ -12865,33 +13246,92 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         return f"{prefix}{suffix}{self.queue_block_status(block)}"
 
     def queue_block_line_parts(self, block: PrintBlock) -> tuple[str, str]:
-        mode = "묶음" if block.bundled else "일반"
-        name_prefix = f"[{block.name_separator_label}] " if block.name_separator_label else ""
-        if block.source != "catalog":
+        name, title, details = self.queue_block_text_parts(block)
+        return name + title + details, f"  //  {block.copies}부  //  "
+
+    @staticmethod
+    def queue_subtab_label(block: PrintBlock) -> str:
+        """Resolve the operator's source tab from metadata, never a PDF name."""
+        if block.source == "catalog":
+            return "단원평가"
+        if block.source in TEST_KIND_BY_SOURCE:
+            return TEST_KIND_BY_SOURCE[block.source]
+        if block.source == "material_apex":
+            return "APEX Boost" if block.level == "APEX Boost" else "APEX"
+        if block.source == "custom":
+            return "묶음 블록" if block.material_kind == "queue_bundle" else "PDF파일"
+        return {
+            "material_able": "A:ble",
+            "material_training_pack": "트레이닝팩",
+            "material_frequent_type": "빈출유형",
+            "material_gyopyeong": "교평 기출",
+            "material_selected_exam": "기출엄선",
+            "material_textbook": "교과서",
+            "material_textbook_variant": "교과서 핵심문제 변형",
+            "blank_review": "백지리뷰",
+            "omr": "OMR",
+        }.get(block.source, "자료")
+
+    def queue_block_text_parts(self, block: PrintBlock) -> tuple[str, str, str]:
+        """Return name, source/subject, and details without changing the block."""
+        name = f"[{block.name_separator_label}] / " if block.name_separator_label else ""
+        source = self.queue_subtab_label(block)
+        title = source if block.subject == source else f"{source} / {block.subject}"
+        details = ["[묶음]"] if block.bundled else []
+        if block.source == "catalog":
+            details.extend((self.queue_level_line_label(block.level), f"{block.round_name}회차"))
+            if block.files:
+                range_text = (f"{self.queue_file_line_label(block.files[0])} ~ "
+                              f"{self.queue_file_line_label(block.files[-1])}")
+            else:
+                range_text = "선택된 파일 없음"
+        else:
+            # Registered labels contain useful publisher/document/range data.
+            # Remove only their exact source and subject prefix, then retain
+            # every detail and original filename shown by the previous UI.
+            label_parts = [part.strip() for part in block.display_label.split("/") if part.strip()]
+            source_prefixes = {source}
+            if block.source == "material_textbook_variant":
+                source_prefixes.add("교과서")
+            elif block.source == "material_training_pack":
+                source_prefixes.add("트팩")
+            registered = block.source != "custom"
+            if registered and label_parts and label_parts[0] in source_prefixes:
+                label_parts.pop(0)
+            if label_parts and label_parts[0] == block.subject:
+                label_parts.pop(0)
+            details.extend(label_parts)
+            if not label_parts and block.source not in {"custom", "blank_review", "omr"}:
+                details.extend(value for value in (block.level, block.round_name) if value and value != source)
             if block.files:
                 start_label = block.files[0].path.stem
                 end_label = block.files[-1].path.stem
                 range_text = f"{start_label} ~ {end_label}" if start_label != end_label else start_label
             else:
                 range_text = "선택된 파일 없음"
-            target = block.target_label
-            return (
-                f"{name_prefix}[ {mode} ] {target} / {range_text}",
-                f"  //  {block.copies}부  //  ",
-            )
-        level = self.queue_level_line_label(block.level)
-        if block.files:
-            start_label = self.queue_file_line_label(block.files[0])
-            end_label = self.queue_file_line_label(block.files[-1])
-            range_text = f"{start_label} ~ {end_label}"
-        else:
-            range_text = "선택된 파일 없음"
-        prefix = (
-            f"{name_prefix}[ {mode} ] {block.subject} / {level} / {block.round_name}회차 / "
-            f"{range_text}"
+        details.append(range_text)
+        return tuple(re.sub(r"[\r\n\t]+", " ", text) for text in (name, title, " / " + " / ".join(details)))
+
+    def draw_queue_title_runs(self, block: PrintBlock, x: float, y: float, max_width: float) -> None:
+        """Clip each styled run with the exact font used by Canvas."""
+        name, title, details = self.queue_block_text_parts(block)
+        runs = (
+            (name, self.queue_line_bold_font, self.colors["complete"]),
+            (title, self.queue_line_bold_font, self.colors["queue_title"]),
+            (details, self.queue_line_font, self.colors["text"]),
         )
-        suffix = f"  //  {block.copies}부  //  "
-        return prefix, suffix
+        right = x + max(0.0, max_width) - 2  # Canvas glyph overhang allowance.
+        for text, font, color in runs:
+            if not text:
+                continue
+            available = right - x
+            if available < font.measure("…"):
+                break
+            clipped = compact_text_pixels(text, available, font)
+            self.queue_canvas.create_text(x, y, text=clipped, anchor="w", fill=color, font=font)
+            x += font.measure(clipped)
+            if clipped != text:
+                break
 
     def draw_queue_card(
         self,
@@ -12929,13 +13369,13 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 y0 + shadow,
                 x1 + shadow,
                 y1 + shadow,
-                radius=14,
-                fill="#cbd5e1",
+                radius=QUEUE_CARD_RADIUS,
+                fill=colors.get("shadow", "#cbd5e1"),
                 outline="",
                 stipple="gray25",
             )
 
-        self.draw_round_rect(x0, y0, x1, y1, radius=14, fill=fill, outline=outline, width=outline_width)
+        self.draw_round_rect(x0, y0, x1, y1, radius=QUEUE_CARD_RADIUS, fill=fill, outline=outline, width=outline_width)
         if selected or dragging:
             marker_fill = colors["accent_hover"] if primary_cursor else colors["link"]
             self.draw_round_rect(x0 + 4, y0 + 9, x0 + 9, y1 - 9, radius=3, fill=marker_fill, outline="")
@@ -12956,8 +13396,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             y0 + 13,
             order_x + 18,
             y1 - 13,
-            radius=18,
-            fill=colors["success_soft"] if selected or dragging else colors["panel_soft"],
+            radius=QUEUE_CARD_RADIUS,
+            fill=colors["accent_soft"] if selected or dragging else colors["panel_soft"],
             outline=colors["link"] if selected or dragging else colors["border_soft"],
             width=1,
         )
@@ -12966,46 +13406,39 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             row_mid,
             text=str(index + 1),
             anchor="center",
-            fill=colors["link"] if selected else "#334155",
-            font=(self.ui_font_family, 15, "bold"),
+            fill=colors["link"] if selected else colors["text"],
+            font=(self.ui_font_family, 13, "bold"),
         )
 
         text_left = x0 + 48
         text_right = order_x - 28
-        line_font = self.queue_line_font
-        prefix_text, suffix_text = self.queue_block_line_parts(block)
         status = self.queue_block_status(block)
         status_text = self.queue_block_status_label(block)
         status_fill, status_fg, status_outline = self.queue_status_colors(status)
-        status_width = max(54, min(92, 24 + line_font.measure(status_text)))
+        status_width = max(54, min(92, 24 + self.queue_status_font.measure(status_text)))
         status_x1 = text_right
         status_x0 = status_x1 - status_width
         copies_right = status_x0 - 8
-        suffix_width = line_font.measure(suffix_text)
-        prefix_width = max(72, copies_right - text_left - suffix_width - 8)
-        line_text = compact_text_pixels(prefix_text, prefix_width, line_font)
-        canvas.create_text(
-            text_left,
-            row_mid,
-            text=line_text,
-            anchor="w",
-            fill=colors["text"],
-            font=line_font,
-        )
+        # Right-side metadata stays secondary; the material title remains one
+        # line and the existing 62px queue geometry does not change.
+        suffix_text = f"{block.copies}부"
+        suffix_width = self.queue_meta_font.measure(suffix_text)
+        prefix_width = max(0, copies_right - text_left - suffix_width - 8)
+        self.draw_queue_title_runs(block, text_left, row_mid, prefix_width)
         canvas.create_text(
             copies_right,
             row_mid,
             text=suffix_text,
             anchor="e",
-            fill=colors["text"],
-            font=line_font,
+            fill=colors["muted"],
+            font=self.queue_meta_font,
         )
         self.draw_round_rect(
             status_x0,
             row_mid - 14,
             status_x1,
             row_mid + 14,
-            radius=14,
+            radius=QUEUE_CARD_RADIUS,
             fill=status_fill,
             outline=status_outline,
             width=1,
@@ -13016,7 +13449,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             text=status_text,
             anchor="center",
             fill=status_fg,
-            font=(self.ui_font_family, 10, "bold"),
+            font=self.queue_status_font,
         )
 
 
@@ -13176,14 +13609,19 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         index = self.queue_hit_index_from_y(self.queue_canvas.canvasy(event.y))
         if index is None:
             return "break"
+        if not self.save_pending_queue_editor():
+            return "break"
         if index not in self.selected_block_indices:
-            self.select_queue_index(index)
+            if not self.select_queue_index(index):
+                return "break"
         self.focus_queue_canvas()
         return self.post_queue_context_menu(event.x_root, event.y_root)
 
     def handle_queue_context_key(self, _event: tk.Event) -> str:
         index = self.selected_block_index()
         if index is None:
+            return "break"
+        if not self.save_pending_queue_editor():
             return "break"
         if not self.selected_block_indices:
             self.select_queue_index(index)
@@ -13222,6 +13660,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         )
         menu.add_separator()
         has_selection = bool(self.selected_block_indices)
+        menu.add_command(
+            label="원본 경로 열기",
+            command=self.open_selected_block_source_folders,
+            state="normal" if has_selection and not getattr(self, "source_paths_open_pending", False) else "disabled",
+        )
         for label, accelerator, command, enabled in (
             ("복사", "Ctrl+C", self.copy_selected_blocks, has_selection),
             ("붙여넣기", "Ctrl+V", self.paste_copied_blocks, bool(getattr(self, "block_clipboard", ()))),
@@ -13240,9 +13683,108 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             menu.grab_release()
         return "break"
 
+    def open_selected_block_source_folders(self) -> str:
+        """Open folders and select registered input PDFs without changing print state."""
+        if getattr(self, "is_closing", False) or getattr(self, "source_paths_open_pending", False):
+            return "break"
+        indices = sorted(index for index in self.selected_block_indices if 0 <= index < len(self.blocks))
+        paths = tuple(item.path for index in indices for item in self.blocks[index].files)
+        if not paths:
+            messagebox.showinfo(APP_TITLE, "등록된 PDF가 있는 블록을 선택해 주세요.", parent=self.root)
+            return "break"
+        folders = source_folder_targets(paths)
+        key = tuple(sorted((os.path.normcase(str(folder)),
+                            tuple(sorted(os.path.normcase(str(path)) for path in files)))
+                           for folder, files in folders))
+        now = time.monotonic()
+        if (key == getattr(self, "source_paths_last_request_key", None)
+                and now - getattr(self, "source_paths_last_request_at", 0.0) < 2.0):
+            return "break"
+        self.source_paths_last_request_key = key
+        self.source_paths_last_request_at = now
+        self.source_paths_open_pending = True
+        cancel = threading.Event()
+        request = (object(), cancel)
+        self.source_paths_open_request = request
+        results = getattr(self, "source_paths_open_results", None)
+        if results is None:
+            results = self.source_paths_open_results = queue.SimpleQueue()
+
+        def work() -> None:
+            try:
+                result = open_source_folders(paths, cancelled=cancel.is_set)
+            except Exception as error:
+                result = error
+            results.put((request, result))
+
+        try:
+            self.launch_source_paths_worker(work)
+        except Exception:
+            self.source_paths_open_pending = False
+            self.source_paths_open_request = None
+            messagebox.showwarning(APP_TITLE, "원본 폴더 열기를 시작하지 못했습니다.", parent=self.root)
+            return "break"
+        self.poll_source_paths_open_results()
+        return "break"
+
+    def launch_source_paths_worker(self, work: Callable[[], None]) -> None:
+        threading.Thread(target=work, name="quick-print-source-paths", daemon=True).start()
+
+    def poll_source_paths_open_results(self) -> None:
+        self.source_paths_open_after_id = None
+        if getattr(self, "is_closing", False):
+            return
+        request = getattr(self, "source_paths_open_request", None)
+        if request is None:
+            return
+        result = None
+        while True:
+            try:
+                completed_request, completed_result = self.source_paths_open_results.get_nowait()
+            except queue.Empty:
+                break
+            if completed_request is request:
+                result = completed_result
+        if result is None:
+            self.source_paths_open_after_id = self.root.after(50, self.poll_source_paths_open_results)
+            return
+        self.source_paths_open_pending = False
+        self.source_paths_open_request = None
+        if request[1].is_set():
+            return
+        if isinstance(result, Exception):
+            messagebox.showwarning(APP_TITLE, "원본 폴더를 확인하지 못했습니다. 다시 실행해 주세요.", parent=self.root)
+            return
+        if result.cancelled:
+            return
+        notices: list[str] = []
+        for paths, label in ((result.missing_files, "찾을 수 없는 PDF"),
+                             (result.missing_folders, "찾을 수 없는 폴더"),
+                             (result.failed_folders, "열지 못한 폴더")):
+            if paths:
+                notices.append(f"{label} {len(paths)}개:\n" + "\n".join(str(path) for path in paths[:3]))
+        if result.skipped_folders:
+            notices.append(f"폴더 {len(result.opened)}개를 열었습니다. 나머지 {result.skipped_folders}개는 선택 범위를 줄여 다시 열어 주세요.")
+        if notices:
+            messagebox.showwarning(APP_TITLE, "\n\n".join(notices), parent=self.root)
+
+    def cancel_source_paths_open(self) -> None:
+        request = getattr(self, "source_paths_open_request", None)
+        if request is not None:
+            request[1].set()
+        self.source_paths_open_request = None
+        self.source_paths_open_pending = False
+        after_id = getattr(self, "source_paths_open_after_id", None)
+        self.source_paths_open_after_id = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
     def group_selected_blocks(self) -> bool:
         if getattr(self, "group_build_pending", False):
-            self.queue_status_var.set("묶음 PDF를 준비 중입니다. 잠시 기다려 주세요.")
+            self.queue_status_var.set("묶음 자료를 확인 중입니다. 잠시 기다려 주세요.")
             return False
         indices = sorted(
             index for index in self.selected_block_indices
@@ -13262,14 +13804,13 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         snapshots = [replace(block, files=list(block.files)) for block in selected]
         printer_var = getattr(self, "printer_var", None)
         base_printer = printer_var.get() if printer_var is not None else DEFAULT_PRINTER
-        cache_dir = MATERIAL_RANGE_CACHE_DIR
         epoch = self.block_preparation_epoch
         token = self.reserve_block_commit()
         self.group_build_pending = True
-        self.queue_status_var.set("묶음 PDF 준비 중 · 작업 큐는 계속 사용할 수 있습니다.")
+        self.queue_status_var.set("묶음 자료 확인 중 · 작업 큐는 계속 사용할 수 있습니다.")
 
         def work() -> object:
-            return make_queue_bundle_block(snapshots, cache_dir, base_printer=base_printer)
+            return make_queue_bundle_block(snapshots, base_printer=base_printer)
 
         def finish(future: object) -> None:
             try:
@@ -13330,6 +13871,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.record_history(
             "blocks_grouped", group_block_id=bundle.history_id,
             source_block_ids=[block.history_id for block in selected],
+            group_mode="document_sequence",
         )
         self.log(f"블록 {len(selected)}개 묶기: {bundle.summary}")
 
@@ -13388,7 +13930,6 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
     def on_queue_drag_start(self, event: tk.Event) -> str:
         self.cancel_drop_animation()
-        self.queue_canvas.focus_set()
         canvas_y = self.queue_canvas.canvasy(event.y)
         index = self.queue_hit_index_from_y(canvas_y)
         if index is None:
@@ -13399,22 +13940,28 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.drag_pointer_offset_y = 0
             self.drag_active = False
             if not event.state & 0x0005:
-                self.select_queue_indices(set())
+                if self.select_queue_indices(set()):
+                    self.focus_queue_canvas()
             else:
+                self.queue_canvas.focus_set()
                 self.draw_queue()
             return "break"
         if event.state & 0x0005:
-            self.select_queue_with_modifiers(index, event.state)
+            selected = self.select_queue_with_modifiers(index, event.state)
             self.drag_start_index = None
             self.drag_selected_indices = ()
             self.drag_drop_index = None
             self.drag_pointer_y = None
             self.drag_pointer_offset_y = 0
             self.drag_active = False
-            self.focus_queue_canvas()
+            if selected:
+                self.focus_queue_canvas()
             return "break"
         selected = set(self.selected_block_indices)
         drag_indices = tuple(sorted(selected)) if index in selected else (index,)
+        if not self.save_queue_editor_before_selection(index, set(drag_indices)):
+            return "break"
+        self.queue_canvas.focus_set()
         if any(self.block_is_scheduled_for_print(self.blocks[item]) for item in drag_indices):
             self.queue_status_var.set("실행 큐에 등록된 블록은 드래그 정렬 불가")
             self.drag_start_index = None
@@ -13459,21 +14006,29 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.drag_active = True
         drop_index = self.queue_drop_index_from_canvas_y(canvas_y)
         self.drag_drop_index = drop_index
-        self.draw_queue()
+        self.request_queue_redraw()
+        drag_indices = self.current_drag_indices()
         if drop_index == len(self.blocks):
             destination = "맨 아래"
         else:
-            projection = self.current_drag_projection()
-            if len(projection.selected_indices) > 1:
+            # Only the selected indices are needed for this label. The complete
+            # projection is built once by the deferred frame or final commit.
+            selected = tuple(sorted(set(drag_indices)))
+            bounded_drop = max(0, min(drop_index, len(self.blocks)))
+            insertion_index = bounded_drop - sum(index < bounded_drop for index in selected)
+            insertion_index = max(0, min(insertion_index, len(self.blocks) - len(selected)))
+            if len(selected) > 1:
                 destination = (
-                    f"{projection.selected_indices[0] + 1}~"
-                    f"{projection.selected_indices[-1] + 1}번 위치"
+                    f"{insertion_index + 1}~"
+                    f"{insertion_index + len(selected)}번 위치"
                 )
             else:
-                destination = f"{projection.insertion_index + 1}번 위치"
-        count = len(self.current_drag_indices())
+                destination = f"{insertion_index + 1}번 위치"
+        count = len(drag_indices)
         prefix = f"블록 {count}개 · " if count > 1 else ""
-        self.queue_status_var.set(f"{prefix}{destination}로 이동")
+        status = f"{prefix}{destination}로 이동"
+        if self.queue_status_var.get() != status:
+            self.queue_status_var.set(status)
         return "break"
 
     def on_queue_drag_release(self, event: tk.Event) -> str:
@@ -13490,11 +14045,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.drag_pointer_offset_y = 0
             self.drag_lift_progress = 0
             self.drag_active = False
-            self.select_queue_indices(
+            selected = self.select_queue_indices(
                 set(drag_indices), focus_index=start_index,
                 anchor_index=self.queue_selection_anchor, load_form=True,
             )
-            self.focus_queue_canvas()
+            if selected:
+                self.focus_queue_canvas()
             return "break"
 
         canvas_y = self.queue_canvas.canvasy(event.y)
@@ -13540,8 +14096,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         canvas_y = self.queue_canvas.canvasy(event.y)
         index = self.queue_hit_index_from_y(canvas_y)
         if index is not None:
-            self.select_queue_index(index, load_form=True)
-            self.focus_queue_editor()
+            if self.select_queue_index(index, load_form=True):
+                self.focus_queue_editor()
         return "break"
 
     @staticmethod
@@ -13582,11 +14138,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
     def schedule_preview_preflight(self, paths: set[Path]) -> None:
         """Resolve automatic PDF routes without blocking the Tk event loop."""
-        unresolved = {path for path in paths if self.cached_preflight_result(path) is None}
-        if not unresolved or self.is_closing:
+        if not paths or self.is_closing:
             return
         with self.preview_preflight_lock:
-            self.preview_preflight_pending_paths.update(unresolved)
+            self.preview_preflight_pending_paths.update(paths)
         self.start_preview_preflight_batch()
 
     def start_preview_preflight_batch(self) -> None:
@@ -13600,6 +14155,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
         def inspect() -> None:
             try:
+                signatures.update((path, self.pdf_preflight_signature(path)) for path in paths)
                 result: PdfPreflightReport | Exception = preflight_pdfs(paths)
             except Exception as error:
                 result = error
@@ -13607,7 +14163,6 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 self.preview_preflight_completed = (result, signatures)
 
         try:
-            signatures = {path: self.pdf_preflight_signature(path) for path in paths}
             threading.Thread(target=inspect, daemon=True).start()
         except Exception as error:
             with self.preview_preflight_lock:
@@ -13649,91 +14204,103 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.start_preview_preflight_batch()
 
     def update_preview(self) -> None:
+        """Coalesce edits; file checks and formatting never run in this callback."""
+        self.cancel_preview_render()
+        if getattr(self, "is_closing", False):
+            return
+        self.preview_update_after_id = self.root.after(1, self.start_preview_render)
+
+    def cancel_preview_render(self) -> None:
+        self.preview_render_revision = getattr(self, "preview_render_revision", 0) + 1
+        for name in ("preview_update_after_id", "preview_render_after_id"):
+            after_id = getattr(self, name, None)
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+            setattr(self, name, None)
+        worker = getattr(self, "preview_render_worker", None)
+        if worker is not None:
+            worker.cancel(self.preview_render_revision)
+        self.preview_render_chunks = None
+
+    def start_preview_render(self) -> None:
+        self.preview_update_after_id = None
+        if getattr(self, "is_closing", False):
+            return
         self.preview_text.delete("1.0", END)
         if not self.blocks:
             self.preview_text.insert(END, "작업 큐가 비어 있습니다. 범위를 선택하고 [블록 추가]를 누르세요.\n")
             self.schedule_resource_estimate()
             return
-        unresolved_paths: set[Path] = set()
-        lines: list[str] = []
-        missing_by_path: dict[Path, str] = {}
-        route_by_path: dict[tuple[Path, str | None], str] = {}
+        self.preview_text.insert(END, "미리보기 갱신 중…\n")
+        try:
+            # Snapshot values on Tk; the worker cannot observe later in-place
+            # edits or read StringVar/BooleanVar. Frozen ExamPdf values are shared.
+            blocks = tuple(replace(block, files=list(block.files)) for block in self.blocks)
+            request = PreviewRequest(
+                blocks=blocks,
+                printer=self.printer_var.get(),
+                name_separator=bool(self.name_separator_page_var.get()),
+                separator=bool(self.separator_page_var.get()),
+                automatic_omr=(self.make_automatic_omr_item() if any(block_requires_omr_sheet(block) for block in blocks) else None),
+                cached_results=dict(self.pdf_preflight_by_path),
+                cached_signatures=dict(self.pdf_preflight_signature_by_path),
+            )
+            # Capture the forecast's Tk variables before the CPU-heavy preview
+            # worker starts. One read per option avoids repeated GIL handoffs.
+            self.schedule_resource_estimate()
+            worker = getattr(self, "preview_render_worker", None)
+            if worker is None:
+                worker = self.preview_render_worker = PreviewWorker()
+            worker.submit(self.preview_render_revision, request)
+            self.preview_render_after_id = self.root.after(10, self.poll_preview_render)
+        except Exception as error:
+            self.show_preview_render_error(error)
 
-        def missing_text(path: Path) -> str:
-            if path not in missing_by_path:
-                missing_by_path[path] = "" if path.exists() else "  [파일 없음]"
-            return missing_by_path[path]
+    def poll_preview_render(self) -> None:
+        self.preview_render_after_id = None
+        if getattr(self, "is_closing", False):
+            return
+        worker = self.preview_render_worker
+        completed = None
+        while True:
+            try:
+                revision, result = worker.results.get_nowait()
+            except queue.Empty:
+                break
+            if revision == self.preview_render_revision:
+                completed = result
+        if completed is None:
+            self.preview_render_after_id = self.root.after(10, self.poll_preview_render)
+            return
+        if isinstance(completed, Exception):
+            self.show_preview_render_error(completed)
+            return
+        self.preview_render_chunks = iter(completed.chunks)
+        self.preview_render_unresolved = completed.unresolved_paths
+        self.preview_text.delete("1.0", END)
+        self.insert_preview_chunk()
 
-        def route_text(item: ExamPdf, printer_override: str | None) -> str:
-            key = (item.path, printer_override)
-            if key not in route_by_path:
-                route_by_path[key] = self.preview_route_text(item, printer_override, unresolved_paths)
-            return route_by_path[key]
+    def insert_preview_chunk(self) -> None:
+        self.preview_render_after_id = None
+        if getattr(self, "is_closing", False) or self.preview_render_chunks is None:
+            return
+        chunk = next(self.preview_render_chunks, None)
+        if chunk is None:
+            self.preview_render_chunks = None
+            self.schedule_preview_preflight(set(self.preview_render_unresolved))
+            return
+        self.preview_text.insert(END, chunk)
+        self.preview_render_after_id = self.root.after(1, self.insert_preview_chunk)
 
-        seq = 1
-        grouped_name_labels = (
-            name_separator_group_labels(self.blocks)
-            if self.name_separator_page_var.get()
-            else (None,) * len(self.blocks)
-        )
-        automatic_omr_item = (
-            self.make_automatic_omr_item()
-            if any(block_requires_omr_sheet(block) for block in self.blocks)
-            else None
-        )
-        for block_index, block in enumerate(self.blocks, start=1):
-            lines.append(f"[블록 {block_index}] {block.summary}\n")
-            grouped_name_label = grouped_name_labels[block_index - 1]
-            if self.name_separator_page_var.get() and grouped_name_label is not None:
-                name_label = grouped_name_label or "[이름 미입력]"
-                lines.append(
-                    f"  {seq:03d}. [이름 구분지] {name_label} x 1부"
-                    f"{self.preview_name_separator_route_text()}\n",
-                )
-                seq += 1
-            if automatic_omr_item is not None and block_requires_omr_sheet(block):
-                missing = missing_text(automatic_omr_item.path)
-                route = route_text(automatic_omr_item, automatic_omr_item.printer_override)
-                lines.append(
-                    f"  {seq:03d}. [자동 OMR] {automatic_omr_item.path.name} "
-                    f"x 1부{missing}{route}\n",
-                )
-                seq += 1
-            if block.bundled:
-                details = []
-                for item in block.files:
-                    printer_override, pages_per_sheet = resolve_exam_print_settings(block, item)
-                    details.append((
-                        item, missing_text(item.path),
-                        "  [A4 가로 2x2]" if pages_per_sheet == 4 else "",
-                        route_text(item, printer_override),
-                    ))
-                for bundle_no in range(1, block.copies + 1):
-                    lines.append(f"  - 묶음 {bundle_no:03d}/{block.copies:03d}\n")
-                    for item, missing, layout, route in details:
-                        lines.append(
-                            f"    {seq:03d}. {item.path.name} x 1부{missing}{layout}{route}\n",
-                        )
-                        seq += 1
-            else:
-                for item in block.files:
-                    missing = missing_text(item.path)
-                    printer_override, pages_per_sheet = resolve_exam_print_settings(block, item)
-                    route = route_text(item, printer_override)
-                    layout = "  [A4 가로 2x2]" if pages_per_sheet == 4 else ""
-                    lines.append(
-                        f"  {seq:03d}. {item.path.name} x {block.copies}부{missing}{layout}{route}\n",
-                    )
-                    seq += 1
-            if self.separator_page_var.get():
-                lines.append(
-                    f"  {seq:03d}. [구분지] 고정 표지 x 1부{self.preview_separator_route_text()}\n",
-                )
-                seq += 1
-            lines.append("\n")
-        self.preview_text.insert(END, "".join(lines))
-        self.schedule_preview_preflight(unresolved_paths)
-        self.schedule_resource_estimate()
+    def show_preview_render_error(self, error: Exception) -> None:
+        self.preview_render_after_id = None
+        self.preview_render_chunks = None
+        self.preview_text.delete("1.0", END)
+        self.preview_text.insert(END, "미리보기를 갱신하지 못했습니다. 다시 편집하면 재시도합니다. 실제 인쇄 전 PDF 검사는 유지됩니다.\n")
+        self.log(f"미리보기 생성 실패: {type(error).__name__}")
 
     def preview_route_text(
         self,
@@ -13784,10 +14351,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         }
         if block.selected_numbers:
             data["selected_numbers"] = list(block.selected_numbers)
-        if block.source == "custom":
+        if block.source == "custom" and block.material_kind != "queue_bundle":
             data["files"] = [str(item.path) for item in block.files]
         elif (
-            block.source.startswith("material_")
+            (block.source == "custom" and block.material_kind == "queue_bundle")
+            or block.source.startswith("material_")
             or block.source.startswith("test_")
             or block.source in FIXED_FORM_SOURCES
         ):
@@ -13884,21 +14452,40 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             printer_route, printer_override = self.resolve_block_printer_route(fixed_route)
         if source == "custom":
             raw_files = data.get("files", [])
-            files = [
-                ExamPdf(index, Path(path).stem, Path(path))
-                for index, path in enumerate(raw_files, start=1)
-            ]
+            files = []
+            try:
+                for index, item in enumerate(raw_files, start=1):
+                    if material_kind == "queue_bundle" and isinstance(item, dict):
+                        number = int(item["number"])
+                        item_pages = item.get("pages_per_sheet")
+                        if number < 1 or item_pages not in {None, 1}:
+                            return None
+                        item_printer = item.get("printer_override")
+                        files.append(ExamPdf(
+                            number, str(item["name"]), Path(str(item["path"])),
+                            printer_override=str(item_printer) if item_printer else None,
+                            pages_per_sheet=item_pages,
+                        ))
+                    else:
+                        files.append(ExamPdf(index, Path(item).stem, Path(item)))
+            except (KeyError, TypeError, ValueError):
+                return None
             if not files:
                 return None
-            if material_kind == "queue_bundle" and (not bundled or len(files) != 1 or pages_per_sheet != 1):
-                return None
-            start = max(1, min(start, len(files)))
-            end = max(start, min(end, len(files)))
-            selected = [item for item in files if start <= item.number <= end]
+            if material_kind == "queue_bundle":
+                if not bundled or pages_per_sheet != 1:
+                    return None
+                start, end = 1, len(files)
+                selected = files
+                selected_numbers = None
+            else:
+                start = max(1, min(start, len(files)))
+                end = max(start, min(end, len(files)))
+                selected = [item for item in files if start <= item.number <= end]
             return PrintBlock(
-                "새 PDF",
-                "",
-                "직접",
+                subject if material_kind == "queue_bundle" else "새 PDF",
+                level if material_kind == "queue_bundle" else "",
+                round_name if material_kind == "queue_bundle" else "직접",
                 start,
                 end,
                 copies,
@@ -13998,6 +14585,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
     def save_current_config(self) -> None:
         eta_samples = self.eta_print_rate_samples()
+        timing_samples = self.eta_job_timing_samples()
         config = {
             "root_dir": self.root_dir_var.get(),
             "printer": self.printer_var.get(),
@@ -14033,6 +14621,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                     )
                 ),
                 ETA_PRINT_RATE_CONFIG_KEY: list(eta_samples),
+                ETA_TIMING_DEVICE_KEY: timing_device_key(str(self.device_monitor_config.get("base_url", ""))),
+                ETA_TIMING_CONFIG_KEY: [
+                    {"sheets": sample.sheets, "copies": sample.copies, "seconds": sample.seconds, "duplex": sample.duplex}
+                    for sample in timing_samples
+                ],
             },
             "blocks": [],
         }
@@ -14109,6 +14702,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         blocks: list[PrintBlock],
         *,
         require_name_separator_labels: bool | None = None,
+        queue_position_by_id: dict[int, int] | None = None,
     ) -> list[PrintBlock]:
         if not blocks:
             raise ValueError("작업 큐가 비어 있습니다. 먼저 블록을 추가해 주세요.")
@@ -14120,11 +14714,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             require_name_separator_labels = bool(variable is not None and variable.get())
         name_separator_paths: list[Path] = []
         if require_name_separator_labels:
-            queue_blocks = getattr(self, "blocks", blocks)
-            queue_position_by_id = {
-                id(queue_block): index
-                for index, queue_block in enumerate(queue_blocks, start=1)
-            }
+            if queue_position_by_id is None:
+                queue_blocks = getattr(self, "blocks", blocks)
+                queue_position_by_id = {
+                    id(queue_block): index
+                    for index, queue_block in enumerate(queue_blocks, start=1)
+                }
             missing = [
                 str(queue_position_by_id.get(id(block), index))
                 for index, block in enumerate(blocks, start=1)

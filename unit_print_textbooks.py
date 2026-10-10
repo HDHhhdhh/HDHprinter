@@ -64,7 +64,9 @@ def _parse_page_ranges(
     return tuple(ranges)
 
 
-def _resolve_relative_pdf(root: Path, value: object) -> tuple[Path, Path]:
+def _resolve_relative_pdf(
+    root: Path, value: object, *, resolved_root: Path | None = None
+) -> tuple[Path, Path]:
     relative_path = Path(str(value))
     if (
         relative_path.is_absolute()
@@ -72,7 +74,8 @@ def _resolve_relative_pdf(root: Path, value: object) -> tuple[Path, Path]:
         or ".." in relative_path.parts
     ):
         raise ValueError(f"안전하지 않은 교과서 PDF 상대 경로입니다: {value}")
-    resolved_root = root.resolve()
+    if resolved_root is None:
+        resolved_root = root.resolve()
     path = (root / relative_path).resolve()
     if not path.is_relative_to(resolved_root):
         raise ValueError(f"교과서 자료 루트 밖의 경로입니다: {value}")
@@ -278,10 +281,14 @@ class TextbookCatalog:
         return subject.find_edition(publisher) if subject is not None else None
 
 
-def _parse_pdf_asset(root: Path, value: object) -> TextbookPdfAsset:
+def _parse_pdf_asset(
+    root: Path, value: object, *, resolved_root: Path | None = None
+) -> TextbookPdfAsset:
     if not isinstance(value, dict):
         raise ValueError("교과서 PDF 정보가 객체가 아닙니다.")
-    relative_path, path = _resolve_relative_pdf(root, value.get("relative_path", ""))
+    relative_path, path = _resolve_relative_pdf(
+        root, value.get("relative_path", ""), resolved_root=resolved_root
+    )
     return TextbookPdfAsset(
         relative_path=relative_path,
         path=path,
@@ -423,6 +430,9 @@ def load_textbook_catalog(
     if not isinstance(raw_subjects, list):
         return TextbookCatalog((), ("교과서 카탈로그 subjects가 배열이 아닙니다.",))
 
+    # Share only the root lookup. Resolve every asset independently so a
+    # symlink cannot escape the captured catalog root.
+    resolved_root = root.resolve()
     subjects: list[TextbookSubject] = []
     issues: list[str] = []
     seen_subjects: set[str] = set()
@@ -456,8 +466,12 @@ def load_textbook_catalog(
                 status = str(raw_edition.get("mapping_status", "pending")).strip()
                 if status not in TEXTBOOK_MAPPING_STATUSES:
                     raise ValueError(f"알 수 없는 mapping_status입니다: {status}")
-                problem = _parse_pdf_asset(root, raw_edition.get("problem"))
-                solution = _parse_pdf_asset(root, raw_edition.get("solution"))
+                problem = _parse_pdf_asset(
+                    root, raw_edition.get("problem"), resolved_root=resolved_root
+                )
+                solution = _parse_pdf_asset(
+                    root, raw_edition.get("solution"), resolved_root=resolved_root
+                )
                 lessons = _parse_lessons(
                     raw_edition.get("lessons", []),
                     problem_page_count=problem.page_count,
@@ -465,7 +479,10 @@ def load_textbook_catalog(
                     required=status == "verified",
                 )
                 core_raw = raw_edition.get("core")
-                core = _parse_pdf_asset(root, core_raw) if core_raw is not None else None
+                core = (
+                    _parse_pdf_asset(root, core_raw, resolved_root=resolved_root)
+                    if core_raw is not None else None
+                )
                 cover_pages = int(raw_edition.get("core_cover_pages", 0))
                 if cover_pages not in (0, 2) or (core is None and cover_pages):
                     raise ValueError("핵심문제 표지 페이지 수가 잘못되었습니다.")
@@ -494,7 +511,10 @@ def load_textbook_catalog(
                 else:
                     raise ValueError("보류 판본에 핵심문제 PDF를 등록할 수 없습니다.")
                 variant_raw = raw_edition.get("variant")
-                variant = _parse_pdf_asset(root, variant_raw) if variant_raw is not None else None
+                variant = (
+                    _parse_pdf_asset(root, variant_raw, resolved_root=resolved_root)
+                    if variant_raw is not None else None
+                )
                 if variant is None:
                     if (raw_edition.get("variant_problem_page_ranges")
                             or raw_edition.get("variant_section_problem_counts")):
