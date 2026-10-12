@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -28,6 +29,7 @@ def app_with_blocks(blocks: list[PrintBlock], indices: set[int]) -> PrintManager
     app.retry_batch = None
     app.undo_stack = []
     app.is_printing = False
+    app.print_state_lock = threading.Lock()
     app.update_queue_view = Mock()
     app.update_preview = Mock()
     app.sync_retry_queue = Mock()

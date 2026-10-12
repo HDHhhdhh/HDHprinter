@@ -5,6 +5,7 @@ import re
 import tempfile
 import threading
 import unittest
+from concurrent.futures import Future
 from datetime import datetime, timedelta
 from dataclasses import replace
 from pathlib import Path
@@ -13,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from pypdf import PdfWriter
 
-from test_unit_print_queue_lifecycle import make_app
+from test_unit_print_queue_lifecycle import Variable, make_app
 from unit_print_device_monitor import DeviceWaitResult
 from unit_print_device_state import DeviceHealth, DeviceJob, DeviceJobState, DeviceSnapshot
 from unit_print_history import HistoryWriteError, PrintHistory, read_history
@@ -180,6 +181,87 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertEqual(4, records[-1]["completed_jobs"])
         self.assertTrue(all(self.app.queue_block_status(block) == "완료" for block in self.blocks))
         self.assertIsNone(self.app.retry_batch)
+
+    def test_real_rolling_worker_uses_grouped_unsent_jobs_once_in_repeated_order(self):
+        self.blocks[2].copies = self.blocks[3].copies = 2
+        self.jobs = tuple(self.app.initialize_active_print_queue(self.blocks, False))
+        self.app.block_preparation_epoch = 0
+        self.app.printer_var = Variable("FAKE")
+        def finish_immediately(work, finish, **_options):
+            future = Future()
+            future.set_result(work())
+            finish(future)
+        self.app.submit_background_block_build = finish_immediately
+        def send_and_group(*args, **kwargs):
+            result = self.monitor.send(*args, **kwargs)
+            if len(self.monitor.sent_tokens) == 1:
+                self.app.selected_block_indices = {2, 3}
+                self.assertTrue(self.app.group_selected_blocks())
+                self.assertEqual(3, len(self.app.blocks))
+            return result
+        self.enqueue.side_effect = send_and_group
+
+        records = self.run_worker()
+
+        bundle = self.app.blocks[2]
+        submitted = [record for record in records if record["event"] == "job_submitted"]
+        bundle_jobs = [record for record in submitted if record["block_id"] == bundle.history_id]
+        self.assertEqual([1, 1, 2, 2], [record["bundle_no"] for record in bundle_jobs])
+        self.assertEqual(6, self.enqueue.call_count)
+        self.assertEqual(6, len({record["job_id"] for record in submitted}))
+        self.assertEqual(self.monitor.sent_tokens, self.monitor.accepted_tokens)
+        self.assertEqual("device_jobs_completed", records[-1]["outcome"])
+        self.assertEqual("완료", self.app.queue_block_status(bundle))
+
+    def test_real_rolling_worker_prints_one_updated_name_separator_for_the_unsent_group(self):
+        self.blocks[0].name_separator_label = "학생B"
+        self.blocks[2].name_separator_label = "학생A"
+        with patch("unit_print_manager.materialize_name_separator_pdf", return_value=self.pdf):
+            self.jobs = tuple(self.app.initialize_active_print_queue(self.blocks, False, True))
+            def send_and_fill(*args, **kwargs):
+                result = self.monitor.send(*args, **kwargs)
+                if len(self.monitor.sent_tokens) == 1:
+                    self.app.selected_block_indices = {1, 2, 3}
+                    self.assertTrue(self.app.fill_selected_block_names())
+                return result
+            self.enqueue.side_effect = send_and_fill
+            records = self.run_worker()
+
+        submitted = [record for record in records if record["event"] == "job_submitted"]
+        names = [record for record in submitted if record["kind"] == "name_separator"]
+        self.assertEqual(["학생B", "학생A"], [record["student_name"] for record in names])
+        self.assertEqual(self.app.blocks[1].history_id, names[1]["block_id"])
+        self.assertEqual(6, self.enqueue.call_count)
+        self.assertEqual(self.monitor.sent_tokens, self.monitor.accepted_tokens)
+        self.assertEqual("device_jobs_completed", records[-1]["outcome"])
+        self.assertTrue(all(self.app.queue_block_status(block) == "완료" for block in self.app.blocks))
+
+    def test_legacy_worker_rejects_cached_jobs_after_reserved_name_fill(self):
+        self.options = replace(self.options, device_completion_mode=False)
+        self.app.print_run_options = self.options
+        self.app.wait_for_queue_refill_window = Mock(side_effect=lambda _printer, _batch, _threshold, count: count)
+        self.app.wait_for_print_queue_empty = Mock(return_value=True)
+        self.blocks[0].name_separator_label = "학생B"
+        self.blocks[2].name_separator_label = "학생A"
+        with patch("unit_print_manager.materialize_name_separator_pdf", return_value=self.pdf):
+            self.jobs = tuple(self.app.initialize_active_print_queue(self.blocks, False, True))
+            def send_and_fill(*_args, **_kwargs):
+                if self.enqueue.call_count == 1:
+                    self.app.selected_block_indices = {1, 2, 3}
+                    self.assertTrue(self.app.fill_selected_block_names())
+                return 1
+            self.enqueue.side_effect = send_and_fill
+            records = self.run_worker()
+
+        submitted = [record for record in records if record["event"] == "job_submitted"]
+        self.assertEqual(["name_separator", "pdf", "name_separator", "pdf", "pdf", "pdf"],
+                         [record["kind"] for record in submitted])
+        self.assertEqual(["학생B", "학생B", "학생A", "학생A", "학생A", "학생A"],
+                         [record["student_name"] for record in submitted])
+        self.assertEqual(6, self.enqueue.call_count)
+        self.assertEqual(6, len({record["job_id"] for record in submitted}))
+        self.assertEqual("windows_queues_empty", records[-1]["outcome"])
+        self.assertTrue(all(self.app.queue_block_status(block) == "완료" for block in self.app.blocks))
 
     def test_completion_clock_receives_exact_unfinished_work_from_real_rolling_worker(self):
         self.monitor.completion_batch_size = 1

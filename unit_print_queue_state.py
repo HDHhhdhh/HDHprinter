@@ -72,6 +72,56 @@ def retain_visible_retry_jobs(batch: RetryBatch | None, blocks: Iterable[object]
     )
 
 
+def editable_waiting_block_ids(
+    blocks: Iterable[Block], statuses: Mapping[int, str], *,
+    scheduled_ids: Iterable[int] = (), started_ids: Iterable[int] = (),
+    pending_jobs: Iterable[Any] = (), retry_jobs: Iterable[Any] = (),
+    active_block_uid: int | None = None,
+) -> set[int]:
+    """Use dispatch ownership as well as delayed Tk badges to protect blocks."""
+    scheduled = set(scheduled_ids)
+    protected = set(started_ids) | {job.block_uid for job in retry_jobs}
+    if active_block_uid is not None:
+        protected.add(active_block_uid)
+    pending = {job.block_uid for job in pending_jobs}
+    return {
+        id(block) for block in blocks
+        if statuses.get(id(block), "대기") in {"대기", "예약", "추가됨"}
+        and id(block) not in protected
+        and (id(block) not in scheduled or id(block) in pending)
+    }
+
+
+def replace_unstarted_block_jobs(
+    jobs: Iterable[Any], replacements: Mapping[int, Iterable[Any]],
+    protected_block_ids: Iterable[int],
+) -> tuple[Any, ...]:
+    """Splice fresh jobs at an old block's first job; keep the claimed prefix."""
+    original = tuple(jobs)
+    protected = set(protected_block_ids)
+    protected_end = max(
+        (index for index, job in enumerate(original) if job.block_uid in protected),
+        default=-1,
+    )
+    replacement_ids = set(replacements)
+    if replacement_ids & protected or any(
+        job.block_uid in replacement_ids for job in original[:protected_end + 1]
+    ):
+        raise ValueError("전송이 시작된 블록과 그 앞의 작업은 변경할 수 없습니다.")
+    if replacement_ids - {job.block_uid for job in original}:
+        raise ValueError("예약 작업이 변경되었습니다. 다시 선택해 주세요.")
+    materialized = {uid: tuple(items) for uid, items in replacements.items()}
+    seen: set[int] = set()
+    result: list[Any] = []
+    for job in original:
+        if job.block_uid not in replacement_ids:
+            result.append(job)
+        elif job.block_uid not in seen:
+            result.extend(materialized[job.block_uid])
+            seen.add(job.block_uid)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class QueueSnapshot:
     # Keep original block identity: re-creating completed blocks would make

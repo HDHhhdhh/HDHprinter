@@ -184,9 +184,11 @@ from unit_print_queue_state import (
     PendingNameRepair,
     QueueReorderResult,
     QueueSnapshot,
+    editable_waiting_block_ids,
     queue_drop_index,
     queue_hit_index,
     reconcile_pending_name_groups,
+    replace_unstarted_block_jobs,
     reorder_selected_items,
     retain_visible_retry_jobs,
     waiting_blocks,
@@ -10904,6 +10906,101 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         with self.print_state_lock:
             return bool(self.is_printing and id(block) in self.print_scheduled_block_ids)
 
+    def editable_queue_block_ids(self, blocks: list[PrintBlock]) -> set[int]:
+        with self.print_state_lock:
+            return self._editable_queue_block_ids_locked(blocks)
+
+    def _editable_queue_block_ids_locked(self, blocks: list[PrintBlock]) -> set[int]:
+        retry = getattr(self, "retry_batch", None)
+        return editable_waiting_block_ids(
+            blocks, self.block_status_by_id,
+            scheduled_ids=getattr(self, "print_scheduled_block_ids", ()),
+            started_ids=getattr(self, "print_started_block_ids", ()),
+            pending_jobs=getattr(self, "print_pending_jobs", ()),
+            retry_jobs=retry.jobs if retry is not None else (),
+            active_block_uid=getattr(self, "active_print_block_uid", None),
+        )
+
+    @staticmethod
+    def prepare_queue_edit_name_paths(blocks: list[PrintBlock], enabled: bool) -> dict[str, Path]:
+        if not enabled:
+            return {}
+        labels = {
+            normalize_name_separator_label(block.name_separator_label)
+            for block in blocks if block_uses_name_separator(block)
+        }
+        return {label: materialize_name_separator_pdf(label, NAME_SEPARATOR_CACHE_DIR)
+                for label in labels if label}
+
+    def apply_waiting_block_replacements(
+        self, replacements: dict[int, tuple[PrintBlock, ...]], *,
+        job_replacements: dict[int, tuple[PrintJob, ...]],
+        prepared_name_paths: dict[str, Path], undo_label: str,
+    ) -> bool:
+        """Commit UI blocks and unclaimed dispatch jobs in one ownership lock."""
+        repair: PendingNameRepair | None = None
+        replaced_job_ids: tuple[str, ...] = ()
+        with self.print_state_lock:
+            selected = [block for block in self.blocks if id(block) in replacements]
+            if (len(selected) != len(replacements)
+                    or set(replacements) - self._editable_queue_block_ids_locked(selected)):
+                return False
+            next_blocks = [item for block in self.blocks
+                           for item in replacements.get(id(block), (block,))]
+            scheduled = set(getattr(self, "print_scheduled_block_ids", ()))
+            changed_scheduled = scheduled & replacements.keys()
+            if changed_scheduled:
+                if not self.is_printing or set(job_replacements) != changed_scheduled:
+                    return False
+                protected = set(getattr(self, "print_started_block_ids", ()))
+                if self.active_print_block_uid is not None:
+                    protected.add(self.active_print_block_uid)
+                replaced_job_ids = tuple(job.job_id for job in self.print_pending_jobs
+                                         if job.block_uid in changed_scheduled)
+                jobs = replace_unstarted_block_jobs(
+                    self.print_pending_jobs, job_replacements, protected,
+                )
+                scheduled = (scheduled - changed_scheduled) | {
+                    job.block_uid for items in job_replacements.values() for job in items
+                }
+                blocks_by_uid = {id(block): block for block in next_blocks}
+                dispatch_blocks = [blocks_by_uid[uid] for uid in dict.fromkeys(
+                    job.block_uid for job in jobs
+                )]
+                repair = self.reconcile_active_name_jobs_locked(
+                    jobs, dispatch_blocks,
+                    (), protected, prepared_name_paths,
+                )
+            self.push_undo_state(undo_label)
+            for old in selected:
+                old_status = self.block_status_by_id.pop(id(old), "대기")
+                old_detail = self.block_detail_by_id.pop(id(old), None)
+                for new in replacements[id(old)]:
+                    same_record = new.history_id == old.history_id
+                    self.block_status_by_id[id(new)] = (
+                        old_status if same_record else "예약" if id(new) in scheduled else "대기"
+                    )
+                    if same_record and old_detail is not None:
+                        self.block_detail_by_id[id(new)] = old_detail
+            self.blocks = next_blocks
+            if repair is not None:
+                self.print_pending_jobs = list(repair.jobs)
+                self.print_scheduled_block_ids = scheduled
+                self.print_last_name_separator_label = (
+                    repair.trailing_name_label if self.print_include_name_separator_pages else ""
+                )
+                self.print_queue_revision = getattr(self, "print_queue_revision", 0) + 1
+        if repair is not None:
+            replacement_job_ids = {job.job_id for items in job_replacements.values() for job in items}
+            self.record_history(
+                "reserved_jobs_replaced", reason=undo_label,
+                replaced_block_ids=[block.history_id for block in selected],
+                removed_job_ids=list(dict.fromkeys(replaced_job_ids + repair.removed_job_ids)),
+                replacement_job_ids=sorted(replacement_job_ids),
+                added_name_separator_job_ids=[job.job_id for job in repair.added_jobs],
+            )
+        return True
+
     @staticmethod
     def trailing_name_separator_label(
         blocks: list[PrintBlock],
@@ -10968,9 +11065,25 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if self.active_print_block_uid is not None:
             started_ids.add(self.active_print_block_uid)
 
-        started_blocks = [block for block in ordered_blocks if id(block) in started_ids]
+        repair = self.reconcile_active_name_jobs_locked(
+            self.print_pending_jobs, ordered_blocks, removed_block_ids, started_ids,
+            prepared_paths,
+        )
+        self.print_pending_jobs = list(repair.jobs)
+        self.print_last_name_separator_label = (
+            repair.trailing_name_label if self.print_include_name_separator_pages else ""
+        )
+        return repair
+
+    def reconcile_active_name_jobs_locked(
+        self, jobs: tuple[PrintJob, ...] | list[PrintJob], ordered_blocks: list[PrintBlock],
+        removed_ids: set[int] | tuple[int, ...], protected_ids: set[int], prepared_paths: dict[str, Path],
+    ) -> PendingNameRepair:
+        started_blocks = [block for block in ordered_blocks if id(block) in protected_ids]
         preceding = self.trailing_name_separator_label(started_blocks)
         def make_name_job(block: PrintBlock, label: str, template: PrintJob) -> PrintJob:
+            if label not in prepared_paths:
+                raise ValueError("이름 구분지 준비 중 큐가 바뀌었습니다. 다시 선택해 주세요.")
             item = ExamPdf(
                 0,
                 f"이름 구분지 - {label}",
@@ -10988,11 +11101,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 history_block=block_history_data(block),
             )
 
-        repair = reconcile_pending_name_groups(
-            self.print_pending_jobs,
+        return reconcile_pending_name_groups(
+            jobs,
             ordered_blocks,
-            removed_block_ids,
-            started_ids,
+            removed_ids,
+            protected_ids,
             enabled=self.print_include_name_separator_pages,
             preceding_name_label=preceding,
             normalize_label=normalize_name_separator_label,
@@ -11001,13 +11114,6 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             job_name_label=lambda job: job.history_block.get("student_name", ""),
             make_name_separator_job=make_name_job,
         )
-        self.print_pending_jobs = list(repair.jobs)
-        self.print_last_name_separator_label = (
-            repair.trailing_name_label
-            if self.print_include_name_separator_pages
-            else ""
-        )
-        return repair
 
     def remove_reserved_blocks_from_active_print(
         self,
@@ -13637,15 +13743,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             previous_menu.destroy()
         menu = tk.Menu(self.queue_canvas, tearoff=False)
         self.queue_context_menu = menu
-        can_group = (
-            not self.is_printing
-            and len(self.selected_block_indices) >= 2
-            and all(
-                self.block_status_by_id.get(id(self.blocks[item]), "대기") == "대기"
-                and not self.blocks[item].bundled
-                for item in self.selected_block_indices
-            )
-        )
+        selected = [self.blocks[index] for index in sorted(self.selected_block_indices)
+                    if 0 <= index < len(self.blocks)]
+        editable_ids = self.editable_queue_block_ids(selected) if len(selected) >= 2 else set()
+        can_group = (len(selected) >= 2 and not getattr(self, "group_build_pending", False)
+                     and all(id(block) in editable_ids and not block.bundled for block in selected))
+        can_fill = (len(selected) >= 2 and all(
+            id(block) in editable_ids for block in selected
+            if not normalize_name_separator_label(block.name_separator_label)
+        ))
         menu.add_command(
             label="묶기",
             accelerator="Ctrl+G",
@@ -13655,7 +13761,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         menu.add_command(
             label="이름 채우기",
             accelerator="Ctrl+Shift+N",
-            state="normal" if not self.is_printing and len(self.selected_block_indices) >= 2 else "disabled",
+            state="normal" if can_fill else "disabled",
             command=self.fill_selected_block_names,
         )
         menu.add_separator()
@@ -13794,12 +13900,21 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             messagebox.showwarning(APP_TITLE, "묶을 일반 블록을 두 개 이상 선택해 주세요.")
             return False
         selected = [self.blocks[index] for index in indices]
-        if self.is_printing or any(
-            self.block_status_by_id.get(id(block), "대기") != "대기"
-            or self.block_is_scheduled_for_print(block)
-            for block in selected
-        ):
-            messagebox.showwarning(APP_TITLE, "인쇄 중이거나 이미 전송된 블록은 묶을 수 없습니다.")
+        with self.print_state_lock:
+            editable = self._editable_queue_block_ids_locked(selected)
+            scheduled_ids = {id(block) for block in selected} & set(
+                getattr(self, "print_scheduled_block_ids", ())
+            )
+            run_key = (self.is_printing, getattr(self, "history_run_id", None))
+            revision = getattr(self, "print_queue_revision", 0)
+            template = next((job for job in getattr(self, "print_pending_jobs", ())
+                             if job.block_uid in scheduled_ids), None)
+            include_separator = bool(scheduled_ids and self.print_include_separator_pages)
+            include_names = bool(scheduled_ids and self.print_include_name_separator_pages)
+            name_context = [replace(block, files=list(block.files)) for block in self.blocks
+                            if id(block) in getattr(self, "print_scheduled_block_ids", ())]
+        if any(id(block) not in editable for block in selected):
+            messagebox.showwarning(APP_TITLE, "전송이 시작됐거나 재시도 대상인 블록은 묶을 수 없습니다.")
             return False
         snapshots = [replace(block, files=list(block.files)) for block in selected]
         printer_var = getattr(self, "printer_var", None)
@@ -13809,12 +13924,19 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.group_build_pending = True
         self.queue_status_var.set("묶음 자료 확인 중 · 작업 큐는 계속 사용할 수 있습니다.")
 
-        def work() -> object:
-            return make_queue_bundle_block(snapshots, base_printer=base_printer)
+        def work() -> tuple[PrintBlock, tuple[PrintJob, ...], dict[str, Path]]:
+            bundle = make_queue_bundle_block(snapshots, base_printer=base_printer)
+            jobs = tuple(self.build_print_jobs(
+                [bundle], include_separator_pages=include_separator,
+                start_block_index=template.block_index, block_total=template.block_total,
+                automatic_omr_item=None,
+            )) if template is not None else ()
+            paths = self.prepare_queue_edit_name_paths(name_context + [bundle], include_names)
+            return bundle, jobs, paths
 
         def finish(future: object) -> None:
             try:
-                bundle = future.result()  # type: ignore[attr-defined]
+                bundle, jobs, name_paths = future.result()  # type: ignore[attr-defined]
             except Exception as error:
                 message = str(error)
 
@@ -13829,19 +13951,30 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             def commit() -> None:
                 self.group_build_pending = False
                 current_printer = printer_var.get() if printer_var is not None else DEFAULT_PRINTER
-                if (self.is_printing or getattr(self, "is_closing", False)
+                if (getattr(self, "is_closing", False)
+                    or (self.is_printing, getattr(self, "history_run_id", None)) != run_key
+                    or (scheduled_ids and getattr(self, "print_queue_revision", 0) != revision)
                     or epoch != self.block_preparation_epoch or current_printer != base_printer
                     or any(
                         index >= len(self.blocks) or self.blocks[index] is not block
                         or block != snapshot
-                        or self.block_status_by_id.get(id(block), "대기") != "대기"
-                        or self.block_is_scheduled_for_print(block)
                         for index, block, snapshot in zip(indices, selected, snapshots)
                     )):
                     self.queue_status_var.set("준비 중 작업 큐가 바뀌어 묶기를 취소했습니다.")
                     messagebox.showwarning(APP_TITLE, "준비 중 작업 큐나 프린터가 바뀌었습니다. 다시 선택해 주세요.")
                     return
-                self.commit_queue_bundle(indices, selected, bundle)
+                error_message = "전송이 시작되거나 예약이 바뀌었습니다. 다시 선택해 주세요."
+                try:
+                    committed = self.commit_queue_bundle(
+                        indices, selected, bundle, scheduled_ids=scheduled_ids,
+                        prepared_jobs=jobs, prepared_name_paths=name_paths,
+                    )
+                except ValueError as error:
+                    error_message = str(error)
+                    committed = False
+                if not committed:
+                    self.queue_status_var.set("전송이 시작되거나 예약이 바뀌어 묶기를 취소했습니다.")
+                    messagebox.showwarning(APP_TITLE, error_message)
 
             self.complete_block_commit(token, commit)
 
@@ -13857,14 +13990,21 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
     def commit_queue_bundle(
         self, indices: list[int], selected: list[PrintBlock], bundle: PrintBlock,
-    ) -> None:
-        self.push_undo_state("블록 묶기")
-        for index in reversed(indices):
-            block = self.blocks.pop(index)
-            self.block_status_by_id.pop(id(block), None)
-            self.block_detail_by_id.pop(id(block), None)
-        self.blocks.insert(indices[0], bundle)
-        self.block_status_by_id[id(bundle)] = "대기"
+        *, scheduled_ids: set[int] | None = None, prepared_jobs: tuple[PrintJob, ...] = (),
+        prepared_name_paths: dict[str, Path] | None = None,
+    ) -> bool:
+        scheduled_ids = scheduled_ids or set()
+        replacements = {id(block): () for block in selected}
+        replacements[id(selected[0])] = (bundle,)
+        job_replacements = {uid: () for uid in scheduled_ids}
+        if scheduled_ids:
+            anchor = next(id(block) for block in selected if id(block) in scheduled_ids)
+            job_replacements[anchor] = prepared_jobs
+        if not self.apply_waiting_block_replacements(
+            replacements, job_replacements=job_replacements,
+            prepared_name_paths=prepared_name_paths or {}, undo_label="블록 묶기",
+        ):
+            return False
         self.sync_retry_queue()
         self.update_queue_view(select_index=indices[0])
         self.update_preview()
@@ -13874,6 +14014,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             group_mode="document_sequence",
         )
         self.log(f"블록 {len(selected)}개 묶기: {bundle.summary}")
+        return True
 
 
     def fill_selected_block_names(self) -> bool:
@@ -13889,32 +14030,45 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         except ValueError as error:
             messagebox.showwarning(APP_TITLE, str(error))
             return False
-        retry = getattr(self, "retry_batch", None)
-        retry_block_ids = {job.block_uid for job in retry.jobs} if retry is not None else set()
         targets = [(indices[position], selected[position]) for position in blank_positions]
         if any(not block_uses_name_separator(block) for _index, block in targets):
             messagebox.showwarning(APP_TITLE, "고정 백지리뷰·OMR 블록은 이름 구분지 대상이 아닙니다.")
             return False
-        if self.is_printing or any(
-            self.block_status_by_id.get(id(block), "대기") != "대기"
-            or id(block) in retry_block_ids
-            for _index, block in targets
-        ):
+        with self.print_state_lock:
+            editable = self._editable_queue_block_ids_locked([block for _, block in targets])
+            scheduled_ids = set(getattr(self, "print_scheduled_block_ids", ()))
+            pending_jobs = tuple(getattr(self, "print_pending_jobs", ()))
+            include_names = bool(self.is_printing and getattr(self, "print_include_name_separator_pages", False))
+        if any(id(block) not in editable for _, block in targets):
             messagebox.showwarning(
                 APP_TITLE,
-                "인쇄 중이거나 전송·재시도 대상인 블록의 이름은 일괄 변경할 수 없습니다.",
+                "전송이 시작됐거나 재시도 대상인 블록의 이름은 일괄 변경할 수 없습니다.",
             )
             return False
 
-        self.push_undo_state("이름 채우기")
-        for index, old_block in targets:
-            new_block = replace(old_block, name_separator_label=name)
-            self.blocks[index] = new_block
-            old_status = self.block_status_by_id.pop(id(old_block), "대기")
-            self.block_status_by_id[id(new_block)] = old_status
-            old_detail = self.block_detail_by_id.pop(id(old_block), None)
-            if old_detail is not None:
-                self.block_detail_by_id[id(new_block)] = old_detail
+        replacements = {id(old): (replace(old, name_separator_label=name),) for _, old in targets}
+        job_replacements: dict[int, tuple[PrintJob, ...]] = {}
+        for old_uid, (new,) in replacements.items():
+            if old_uid in scheduled_ids:
+                history = block_history_data(new)
+                job_replacements[old_uid] = tuple(
+                    replace(job, block_uid=id(new), block_summary=new.summary,
+                            history_block=history, job_id=str(uuid.uuid4()))
+                    for job in pending_jobs if job.block_uid == old_uid and not job.is_name_separator
+                )
+        try:
+            name_context = [replacements.get(id(block), (block,))[0] for block in self.blocks
+                            if id(block) in scheduled_ids]
+            paths = self.prepare_queue_edit_name_paths(name_context, include_names and bool(job_replacements))
+            if not self.apply_waiting_block_replacements(
+                replacements, job_replacements=job_replacements,
+                prepared_name_paths=paths, undo_label="이름 채우기",
+            ):
+                messagebox.showwarning(APP_TITLE, "전송이 시작되거나 예약이 바뀌었습니다. 다시 선택해 주세요.")
+                return False
+        except (OSError, ValueError) as error:
+            messagebox.showwarning(APP_TITLE, str(error))
+            return False
         self.selected_block_indices = set(indices)
         self.update_queue_view()
         self.update_preview()

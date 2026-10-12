@@ -447,6 +447,7 @@ class QueueBundleTest(unittest.TestCase):
             app.selected_block_indices = {0, 1, 2}
             app.block_status_by_id = {id(block): "대기" for block in blocks}
             app.is_printing = False
+            app.print_state_lock = threading.Lock()
             app.queue_canvas = Mock()
             app.queue_canvas.canvasy.return_value = 100
             app.queue_hit_index_from_y = Mock(return_value=1)
