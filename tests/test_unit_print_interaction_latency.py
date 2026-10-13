@@ -79,8 +79,13 @@ def catalog_app():
     app.queue_selection_anchor = None
     app.keyboard_state = KeyboardState()
     app.keyboard_state.enter_editor(cursor=0)
-    app.keyboard_state.editor_dirty = True
+    # No block is bound yet, so the initial fields are not an unsaved draft.
+    app.keyboard_state.editor_dirty = False
     app.editor_syncing = False
+    app.editor_block = None
+    app.editor_baseline = None
+    app.editor_save_in_progress = False
+    app.queue_status_var = Variable()
     app.draw_queue = Mock()
     app.refresh_editor_status = Mock()
     app.refresh_name_separator_editor_state = Mock()
@@ -108,6 +113,8 @@ def catalog_app():
 class InteractionLatencyTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(patch.stopall)
+        for name in ("showwarning", "showinfo", "showerror", "askyesno"):
+            patch("unit_print_manager.messagebox." + name, side_effect=AssertionError(name)).start()
         for name in ("sumatra_enqueue_pdfs", "save_config", "load_printers", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
         self.files = [ExamPdf(number, f"file {number}", Path(f"synthetic-{number}.pdf")) for number in (1, 2, 3)]
@@ -155,6 +162,7 @@ class InteractionLatencyTests(unittest.TestCase):
     def test_empty_explicit_load_still_clears_editor_once(self):
         app = catalog_app()
         app.blocks.clear()
+        app.keyboard_state.editor_dirty = True
         with patch.object(app, "populate_queue_editor", wraps=app.populate_queue_editor) as populate:
             app.select_queue_indices(set(), load_form=True)
         populate.assert_called_once_with(None)
@@ -164,6 +172,7 @@ class InteractionLatencyTests(unittest.TestCase):
 
     def test_editor_sync_guard_cleans_up_on_population_failure(self):
         app = catalog_app()
+        app.keyboard_state.editor_dirty = True
         with patch.object(app, "_populate_queue_editor", side_effect=ValueError("synthetic failure")):
             with self.assertRaises(ValueError):
                 app.populate_queue_editor(0)
