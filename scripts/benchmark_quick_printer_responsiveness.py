@@ -65,7 +65,7 @@ def isolated_app(stack: ExitStack, temporary: Path, phase_timings: dict[str, lis
     stack.enter_context(patch.object(unit_print_materials, "analyze_apex_document",
                                     side_effect=AssertionError("Registered APEX cache miss")))
     forbidden = []
-    for name in ("load_printers", "run_powershell", "shell_print_pdf", "sumatra_enqueue_pdfs",
+    for name in ("load_printers", "run_powershell", "sumatra_enqueue_pdfs",
                  "save_device_credential", "load_device_credential", "delete_device_credential"):
         forbidden.append(stack.enter_context(patch.object(
             manager, name, side_effect=AssertionError(f"Forbidden external operation: {name}"))))

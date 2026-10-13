@@ -43,7 +43,7 @@ class RecoveryWorkflowTests(unittest.TestCase):
         self.warning = patch("unit_print_manager.messagebox.showwarning").start()
         self.info = patch("unit_print_manager.messagebox.showinfo").start()
         patch("unit_print_manager.messagebox.showerror").start()
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "load_printers",
+        for name in ("sumatra_enqueue_pdfs", "load_printers",
                      "get_print_queue_count", "run_powershell", "save_config"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
 

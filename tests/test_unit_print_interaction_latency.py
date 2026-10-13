@@ -108,7 +108,7 @@ def catalog_app():
 class InteractionLatencyTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(patch.stopall)
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "save_config", "load_printers", "run_powershell"):
+        for name in ("sumatra_enqueue_pdfs", "save_config", "load_printers", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
         self.files = [ExamPdf(number, f"file {number}", Path(f"synthetic-{number}.pdf")) for number in (1, 2, 3)]
         self.levels = patch("unit_print_manager.catalog_levels", return_value=("Lv.1", "Lv.2")).start()

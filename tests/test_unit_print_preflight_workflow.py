@@ -64,7 +64,7 @@ class PreviewPreflightTests(unittest.TestCase):
         self.inspect = patch("unit_print_manager.preflight_pdfs").start()
         self.addCleanup(patch.stopall)
         # These preview tests must never launch a process, print, or write history.
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "run_powershell"):
+        for name in ("sumatra_enqueue_pdfs", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
 
     def run_worker(self):

@@ -156,7 +156,7 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.enqueue = patch("unit_print_manager.sumatra_enqueue_pdfs", side_effect=self.monitor.send).start()
         self.addCleanup(patch.stopall)
         patch("unit_print_manager.DEVICE_DISPATCH_SPOOL_DIR", self.directory / "spool").start()
-        for name in ("shell_print_pdf", "save_config", "load_printers", "get_print_queue_count", "run_powershell"):
+        for name in ("save_config", "load_printers", "get_print_queue_count", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
         patch("unit_print_manager.messagebox.showerror").start()
 

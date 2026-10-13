@@ -20,7 +20,7 @@ class EditorAutosaveTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         self.warning = patch("unit_print_manager.messagebox.showwarning").start()
         self.confirm = patch("unit_print_manager.messagebox.askyesno", return_value=True).start()
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "save_config", "load_printers",
+        for name in ("sumatra_enqueue_pdfs", "save_config", "load_printers",
                      "get_print_queue_count", "run_powershell", "take_windows_ime_composition"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
 

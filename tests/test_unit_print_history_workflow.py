@@ -44,7 +44,7 @@ class PrintHistoryWorkflowTests(unittest.TestCase):
         self.options = self.app.print_run_options
         self.enqueue = patch("unit_print_manager.sumatra_enqueue_pdfs", return_value=1).start()
         self.addCleanup(patch.stopall)
-        for name in ("shell_print_pdf", "save_config", "load_printers", "get_print_queue_count", "run_powershell"):
+        for name in ("save_config", "load_printers", "get_print_queue_count", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
         for name in ("showwarning", "showerror", "showinfo"):
             patch("unit_print_manager.messagebox." + name).start()

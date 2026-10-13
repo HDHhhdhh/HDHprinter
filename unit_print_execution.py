@@ -180,33 +180,6 @@ class PrintExecutionMixin:
         if self.print_cancel_event.is_set():
             raise PrintCancelled("사용자가 남은 작업 전송을 중지했습니다.")
 
-    def wait_for_queue_capacity(
-        self,
-        printer_name: str,
-        queue_limit: int,
-        timeout_seconds: float = QUEUE_REFILL_TIMEOUT_SECONDS,
-    ) -> None:
-        services = self.print_execution_services()
-        queue_limit = max(1, queue_limit)
-        last_logged_count: int | None = None
-        started_at = time.monotonic()
-        while True:
-            self.raise_if_print_cancelled()
-            count = services.get_print_queue_count(printer_name)
-            if count < queue_limit:
-                if last_logged_count is not None:
-                    self.log(f"대기열 여유 확보: 현재 {count}개 / 제한 {queue_limit}개")
-                return
-            if count != last_logged_count:
-                self.log(f"대기열 대기: 현재 {count}개 / 제한 {queue_limit}개")
-                last_logged_count = count
-            if time.monotonic() - started_at >= timeout_seconds:
-                raise TimeoutError(
-                    f"{printer_name} 대기열이 {timeout_seconds / 60:.0f}분 동안 비워지지 않았습니다."
-                )
-            if self.print_cancel_event.wait(2.0):
-                self.raise_if_print_cancelled()
-
     def wait_for_queue_refill_window(
         self,
         printer_name: str,

@@ -27,7 +27,7 @@ class KeyboardWorkflowTests(unittest.TestCase):
             patch("unit_print_manager.messagebox." + name).start()
         patch("unit_print_manager.messagebox.askyesno", return_value=True).start()
         for name in (
-            "sumatra_enqueue_pdfs", "shell_print_pdf", "save_config",
+            "sumatra_enqueue_pdfs", "save_config",
             "load_printers", "get_print_queue_count", "run_powershell",
         ):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
