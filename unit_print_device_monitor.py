@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from unit_print_canon_status import CanonStatusClient
@@ -40,6 +40,7 @@ class PrinterDeviceMonitor:
         self._snapshot = DeviceSnapshot.unavailable("프린터 상태 연결 전", source_url=client.base_url)
         self._active_waiters = 0
         self._fast_probe_sessions = 0
+        self._consecutive_stale_reads = 0
 
     @property
     def latest_snapshot(self) -> DeviceSnapshot:
@@ -89,6 +90,8 @@ class PrinterDeviceMonitor:
 
     def _publish(self, snapshot: DeviceSnapshot) -> None:
         with self._condition:
+            self._consecutive_stale_reads = self._consecutive_stale_reads + 1 if snapshot.stale else 0
+            snapshot = replace(snapshot, consecutive_stale_reads=self._consecutive_stale_reads)
             self._snapshot = snapshot
             self._condition.notify_all()
         if self.on_update is not None:

@@ -100,6 +100,16 @@ class DeviceSnapshot:
     authenticated: bool = False
     source_url: str = ""
     stale: bool = False
+    consecutive_stale_reads: int = 0
+
+    @property
+    def connectivity_only(self) -> bool:
+        return (
+            self.stale
+            and self.health == DeviceHealth.OFFLINE
+            and not any(job.state in {DeviceJobState.HELD, DeviceJobState.FAILED}
+                        for job in (*self.active_jobs, *self.recent_jobs))
+        )
 
     @classmethod
     def unavailable(

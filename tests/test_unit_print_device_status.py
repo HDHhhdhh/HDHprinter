@@ -4,6 +4,7 @@ import tempfile
 import json
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from unit_print_canon_status import CanonStatusClient, parse_health_html, parse_jobs_html, parse_supplies_html
@@ -14,7 +15,7 @@ from datetime import datetime
 
 from unit_print_device_state import DeviceHealth, DeviceJob, DeviceJobState, DeviceSnapshot
 from unit_print_device_ui import build_device_status_view
-from unit_print_dispatch_state import RollingDispatchWindow
+from unit_print_dispatch_state import DeviceDispatchHold, RollingDispatchWindow, STALE_READ_HOLD_THRESHOLD
 from unit_print_eta import (
     completed_job_seconds_per_sheet,
     estimate_remaining_seconds,
@@ -579,6 +580,96 @@ class _FastProbeClient:
 
 
 class DeviceDispatchTests(unittest.TestCase):
+    def test_monitor_counts_actual_stale_publications_and_resets_on_recovery(self) -> None:
+        updates = []
+        monitor = PrinterDeviceMonitor(_FastProbeClient([()]), on_update=updates.append)
+        stale = DeviceSnapshot.unavailable("timeout")
+        for count in range(1, STALE_READ_HOLD_THRESHOLD + 1):
+            monitor._publish(stale)
+            self.assertEqual(count, monitor.latest_snapshot.consecutive_stale_reads)
+            self.assertFalse(monitor.latest_snapshot.can_dispatch)
+        monitor._publish(DeviceSnapshot(observed_at=datetime.now().astimezone(),
+                                       health=DeviceHealth.READY, authenticated=True))
+        self.assertEqual(0, monitor.latest_snapshot.consecutive_stale_reads)
+        self.assertEqual([1, 2, 3, 0], [snapshot.consecutive_stale_reads for snapshot in updates])
+
+    def test_one_stale_read_blocks_dispatch_without_operator_hold(self) -> None:
+        hold = DeviceDispatchHold()
+        stale = DeviceSnapshot.unavailable("timeout")
+        for _ in range(5):
+            self.assertFalse(hold.observe(stale))
+        self.assertEqual("", hold.kind)
+        self.assertFalse(stale.can_dispatch)
+        healthy = DeviceSnapshot(observed_at=datetime.now().astimezone(),
+                                 health=DeviceHealth.READY, authenticated=True)
+        self.assertFalse(hold.observe(healthy))
+        self.assertTrue(healthy.can_dispatch)
+        # Normal recovery resets the consecutive-failure count.
+        self.assertFalse(hold.observe(DeviceSnapshot.unavailable("another timeout")))
+        self.assertEqual("", hold.kind)
+
+    def test_three_stale_reads_hold_and_normal_snapshot_auto_resumes(self) -> None:
+        hold = DeviceDispatchHold()
+        stale = DeviceSnapshot.unavailable("timeout")
+        for count in range(1, STALE_READ_HOLD_THRESHOLD + 1):
+            snapshot = replace(stale, consecutive_stale_reads=count)
+            self.assertEqual(count == STALE_READ_HOLD_THRESHOLD, hold.observe(snapshot))
+        self.assertEqual("stale", hold.kind)
+        self.assertFalse(hold.can_resume(stale, operator_resume=True))
+        healthy = DeviceSnapshot(observed_at=datetime.now().astimezone(),
+                                 health=DeviceHealth.READY, authenticated=True)
+        hold.observe(healthy)
+        self.assertTrue(hold.can_resume(healthy, operator_resume=False))
+        hold.resume()
+        self.assertEqual("", hold.kind)
+
+    def test_monitor_reads_between_worker_iterations_still_promote_hold(self) -> None:
+        hold = DeviceDispatchHold()
+        stale = replace(DeviceSnapshot.unavailable("timeout"), consecutive_stale_reads=3)
+        self.assertTrue(hold.observe(stale))
+        self.assertEqual("stale", hold.kind)
+
+    def test_monitor_reset_between_worker_iterations_does_not_accumulate_failures(self) -> None:
+        hold = DeviceDispatchHold()
+        stale = DeviceSnapshot.unavailable("timeout")
+        self.assertFalse(hold.observe(replace(stale, consecutive_stale_reads=2)))
+        # A successful monitor read occurred between these worker iterations.
+        self.assertFalse(hold.observe(replace(stale, consecutive_stale_reads=1)))
+        self.assertEqual("", hold.kind)
+
+    def test_fault_is_immediate_and_stays_manual_through_stale_recovery(self) -> None:
+        hold = DeviceDispatchHold()
+        fault = DeviceSnapshot(observed_at=datetime.now().astimezone(),
+                               health=DeviceHealth.ERROR, errors=("paper",), authenticated=True)
+        self.assertTrue(hold.observe(fault))
+        self.assertEqual("fault", hold.kind)
+        hold.observe(replace(DeviceSnapshot.unavailable("timeout"), consecutive_stale_reads=3))
+        self.assertEqual("fault", hold.kind)
+        healthy = replace(fault, health=DeviceHealth.READY, errors=())
+        hold.observe(healthy)
+        self.assertFalse(hold.can_resume(healthy, operator_resume=False))
+        self.assertTrue(hold.can_resume(healthy, operator_resume=True))
+        self.assertFalse(hold.can_resume(healthy, operator_resume=True, job_held=True))
+
+    def test_stale_hold_escalates_to_manual_hold_on_real_device_fault(self) -> None:
+        hold = DeviceDispatchHold()
+        hold.observe(replace(DeviceSnapshot.unavailable("timeout"), consecutive_stale_reads=3))
+        fault = DeviceSnapshot(observed_at=datetime.now().astimezone(),
+                               health=DeviceHealth.HELD, authenticated=True)
+        self.assertTrue(hold.observe(fault))
+        self.assertEqual("fault", hold.kind)
+        healthy = replace(fault, health=DeviceHealth.READY)
+        self.assertFalse(hold.can_resume(healthy, operator_resume=False))
+
+    def test_stale_snapshot_with_held_job_is_a_fault_not_connectivity_only(self) -> None:
+        hold = DeviceDispatchHold()
+        snapshot = replace(DeviceSnapshot.unavailable("timeout"), active_jobs=(
+            DeviceJob("held", state=DeviceJobState.HELD),
+        ))
+        self.assertFalse(snapshot.connectivity_only)
+        self.assertTrue(hold.observe(snapshot))
+        self.assertEqual("fault", hold.kind)
+
     def test_device_status_headline_never_duplicates_printer_prefix(self) -> None:
         snapshot = DeviceSnapshot.unavailable("프린터 상태 연결 전")
         self.assertEqual("프린터 상태 연결 전", build_device_status_view(snapshot).headline)
