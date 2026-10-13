@@ -13,6 +13,7 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -837,20 +838,48 @@ def get_print_queue_count(printer_name: str) -> int:
     return 0
 
 
-def load_config() -> dict:
+def load_config(*, startup_report=None) -> dict:
     if not CONFIG_PATH.exists():
         return {}
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, UnicodeError):
+        from unit_print_bootstrap import show_notice
+        backup = CONFIG_PATH.with_name(
+            f"{CONFIG_PATH.stem}.corrupt-{datetime.now():%Y%m%d_%H%M%S_%f}.json"
+        )
+        try:
+            shutil.copy2(CONFIG_PATH, backup)
+        except OSError:
+            if startup_report is not None:
+                startup_report("config_corrupt_backup_failed")
+            show_notice("설정 파일이 손상되었고 백업에 실패했습니다.\n설정 파일과 폴더 권한을 확인해 주세요.", error=True)
+            # Do not allow a later defaults save to overwrite the only copy.
+            raise
+        if startup_report is not None:
+            startup_report("config_corrupt_backed_up")
+        show_notice(
+            f"설정 파일이 손상되어 기본 설정으로 시작합니다.\n손상 파일 백업: {backup.name}\n프린터와 장비 연결 설정을 다시 확인해 주세요."
+        )
         return {}
 
 
 def save_config(config: dict) -> None:
-    CONFIG_PATH.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    content = json.dumps(config, ensure_ascii=False, indent=2)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=".config-", suffix=".tmp",
+            dir=CONFIG_PATH.parent, delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def ensure_separator_pdf() -> Path:
@@ -1182,7 +1211,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
     def __init__(self, root: Tk) -> None:
         self.root = root
-        self.config = load_config()
+        self.config = load_config(startup_report=getattr(root, "startup_report", None))
         self.catalog = load_unit_catalog()
         self.test_catalogs: dict[str, TestCatalog] = scan_default_test_catalogs()
         self.apex_material_catalog = load_apex_catalog(DEFAULT_APEX_ROOT, MATERIAL_CATALOG_PATH)
@@ -14963,6 +14992,7 @@ def run_application(*, error_handler=None, startup_report=None) -> None:
     set_windows_app_user_model_id()
     set_windows_dpi_awareness()
     root = TkinterDnD.Tk() if TkinterDnD is not None else Tk()
+    root.startup_report = startup_report
     if error_handler is not None:
         root.report_callback_exception = error_handler
     try:

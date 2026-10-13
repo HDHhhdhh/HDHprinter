@@ -1,5 +1,6 @@
 # Operator data is local and never part of source control.
 /unit_print_manager_config.json
+/unit_print_manager_config.corrupt-*.json
 /quick_printer_local_paths.json
 /quick_printer_asset_channel.local.json
 /unit_print_material_catalog.json
