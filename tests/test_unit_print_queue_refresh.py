@@ -71,7 +71,7 @@ def make_app(blocks):
 class QueueRefreshTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(patch.stopall)
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "save_config",
+        for name in ("sumatra_enqueue_pdfs", "save_config",
                      "load_printers", "get_print_queue_count", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
 

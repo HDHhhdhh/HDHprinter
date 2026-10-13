@@ -1115,40 +1115,6 @@ def load_printers() -> list[str]:
         return [DEFAULT_PRINTER]
 
 
-def shell_print_pdf(pdf_path: Path, printer_name: str) -> None:
-    result = ctypes.windll.shell32.ShellExecuteW(
-        None,
-        "printto",
-        str(pdf_path),
-        f'"{printer_name}"',
-        None,
-        0,
-    )
-    if result <= 32:
-        raise RuntimeError(f"Windows printto failed with code {result}: {pdf_path}")
-
-
-def sumatra_print_pdf(
-    sumatra_path: str,
-    pdf_path: Path,
-    printer_name: str,
-    copies: int,
-    duplex: bool,
-    timeout: int = 180,
-) -> None:
-    sumatra_enqueue_pdfs(sumatra_path, [pdf_path], printer_name, copies, duplex, timeout=timeout)
-
-
-def sumatra_enqueue_pdf(
-    sumatra_path: str,
-    pdf_path: Path,
-    printer_name: str,
-    copies: int,
-    duplex: bool,
-) -> None:
-    sumatra_enqueue_pdfs(sumatra_path, [pdf_path], printer_name, copies, duplex)
-
-
 def sumatra_enqueue_pdfs(
     sumatra_path: str,
     pdf_paths: list[Path],

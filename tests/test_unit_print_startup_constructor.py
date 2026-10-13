@@ -50,7 +50,7 @@ class StartupConstructorTests(unittest.TestCase):
             side_effect=AssertionError("A registered startup cache missed: migration must preserve PDF size and mtime."),
         ))
         forbidden = {}
-        for name in ("load_printers", "run_powershell", "shell_print_pdf", "sumatra_enqueue_pdfs",
+        for name in ("load_printers", "run_powershell", "sumatra_enqueue_pdfs",
                      "save_device_credential", "load_device_credential", "delete_device_credential"):
             forbidden[name] = self.enterContext(patch.object(manager, name, side_effect=AssertionError(f"External startup operation: {name}")))
         for name in ("activate_windows_korean_input", "set_windows_ime_composition_font",

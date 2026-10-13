@@ -46,7 +46,7 @@ class PrinterBindingWorkflowTests(unittest.TestCase):
         patch("unit_print_manager.messagebox.showinfo").start()
         self.confirm = patch("unit_print_manager.messagebox.askyesno", return_value=True).start()
         self.worker = patch("unit_print_manager.threading.Thread").start()
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "save_config", "load_printers", "run_powershell"):
+        for name in ("sumatra_enqueue_pdfs", "save_config", "load_printers", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
 
     @staticmethod

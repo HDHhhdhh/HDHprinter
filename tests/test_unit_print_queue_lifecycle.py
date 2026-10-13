@@ -79,7 +79,7 @@ class QueueLifecycleTests(unittest.TestCase):
         for name in ("showinfo", "showwarning", "showerror"):
             patch("unit_print_manager.messagebox." + name).start()
         # Tripwires: these tests can never reach a real printer or config write.
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "save_config", "load_printers",
+        for name in ("sumatra_enqueue_pdfs", "save_config", "load_printers",
                      "get_print_queue_count", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
         self.worker = patch("unit_print_manager.threading.Thread").start()

@@ -40,7 +40,7 @@ class QueueBundleTest(unittest.TestCase):
         self.addCleanup(patch.stopall)
         # Grouping must never materialize a merged PDF or reach live printing.
         for name in (
-            "materialize_pdf_documents", "sumatra_enqueue_pdfs", "shell_print_pdf",
+            "materialize_pdf_documents", "sumatra_enqueue_pdfs",
             "get_print_queue_count", "run_powershell", "save_config",
         ):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()

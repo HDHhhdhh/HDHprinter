@@ -180,7 +180,7 @@ class PrintStartPreparationTests(unittest.TestCase):
         self.confirm = self.enterContext(patch("unit_print_manager.messagebox.askyesno", return_value=True))
         self.warning = self.enterContext(patch("unit_print_manager.messagebox.showwarning"))
         self.info = self.enterContext(patch("unit_print_manager.messagebox.showinfo"))
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "save_config", "load_printers", "run_powershell"):
+        for name in ("sumatra_enqueue_pdfs", "save_config", "load_printers", "run_powershell"):
             self.enterContext(patch("unit_print_manager." + name, side_effect=AssertionError(name)))
         self.addCleanup(self.close_worker)
 

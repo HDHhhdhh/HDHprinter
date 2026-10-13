@@ -44,7 +44,7 @@ class ActiveQueueEditTest(unittest.TestCase):
         self.app.submit_background_block_build = Mock()
         for name in ("showinfo", "showwarning", "showerror"):
             patch("unit_print_manager.messagebox." + name).start()
-        for name in ("sumatra_enqueue_pdfs", "shell_print_pdf", "save_config",
+        for name in ("sumatra_enqueue_pdfs", "save_config",
                      "get_print_queue_count", "run_powershell"):
             patch("unit_print_manager." + name, side_effect=AssertionError(name)).start()
         self.make_name = patch("unit_print_manager.materialize_name_separator_pdf",

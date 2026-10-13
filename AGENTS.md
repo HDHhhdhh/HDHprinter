@@ -82,7 +82,6 @@ Its current product contract is `빠른인쇄기_제품동작_정본.md`; operat
 | Printer destination verification | `ensure_device_printer_binding()`, `assert_device_binding_for_dispatch()`, `unit_print_printer_binding.py` | Validate actual body/name/separator/OMR TCP/IP targets before start/retry/append; retain approved names and monitor identity during dispatch. |
 | Persistent history | `unit_print_history.PrintHistory`, `unit_print_history_events.PrintHistoryMixin` | Queue changes and print events; required history writes precede dispatch. |
 | Sumatra printing | `sumatra_enqueue_pdfs()` | Default engine; shared prioritized preparation and next-two look-ahead live in `unit_print_preparation.py`. |
-| Windows fallback | `shell_print_pdf()` | Uses ShellExecute `printto`; sends one copy at a time. |
 | Printer queue polling | `get_print_queue_count()`, `wait_for_*()` | PowerShell `Get-PrintJob` controls pacing and final completion status. |
 | Resource forecast | `unit_print_resource_estimate.py`, `unit_print_eta.py`, `schedule_resource_estimate()` | Dedicated cancellable worker for page counts, duplex/4-up sheets, staple sets, and supplies. ETA uses short/long/repeated workload timings, sheet-weighted long samples, actual dispatch count and a separate point estimate. Remove queue waiting with preceding exact device completion; reject held/external intervals and cold first short samples. Deduct only identified active printing time, bounded by submission and local completion observation. Cache repeated workload shapes per forecast. |
 | Windows notifications | `unit_print_notifications.py`, `notify_operator()` | Transition-only error, recovery, and completion balloons; never notify on every poll. |
@@ -163,7 +162,7 @@ Use `.venv\Scripts\python.exe` instead of `python` when using the app virtual en
 - Preserve the approved GUI's placement, dimensions, alignment, fonts, colors, and keyboard behavior outside the requested change. A successful screenshot capture alone does not establish absence of clipping or interaction regressions.
 - Treat `unit_print_manager_config.json` as local operator state, not a stable fixture.
 - Do not trigger live printing or driver dialogs during investigation without explicit current-task approval.
-- Prefer SumatraPDF path validation through `find_sumatra_pdf()`; Windows `printto` is only the fallback.
+- Prefer SumatraPDF path validation through `find_sumatra_pdf()`.
 - Preserve preview/dry-run behavior when touching print flow.
 - Keep registered print PDFs, student/order data, local settings, and printer credentials out of Git and general release documents. Retain the tracked fixed separator asset and existing verified release policy.
 - JSONL history and exported history CSVs contain student information. Keep them outside Git and release bundles; the module and CLI source belong in the release, the operator's records do not.
