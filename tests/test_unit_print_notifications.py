@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from unittest.mock import Mock
 
 from unit_print_device_state import DeviceHealth, DeviceSnapshot
+from unit_print_dispatch_state import STALE_READ_HOLD_THRESHOLD
 from unit_print_manager import PrintManagerApp
 from unit_print_notifications import (
     NotificationGate,
@@ -107,6 +109,20 @@ class NotificationTests(unittest.TestCase):
 
         self.assertEqual("프린터 정상 복구", app.notify_operator.call_args.args[2])
         self.assertFalse(app.device_fault_notification_active)
+
+    def test_active_run_transient_stale_read_does_not_alert_until_threshold(self) -> None:
+        app = PrintManagerApp.__new__(PrintManagerApp)
+        app.is_printing = True
+        app.last_device_notification_health = DeviceHealth.READY
+        app.notification_gate = NotificationGate()
+        app.notify_device_fault = Mock()
+        stale = DeviceSnapshot.unavailable("timeout")
+        for count in range(1, STALE_READ_HOLD_THRESHOLD):
+            app.handle_device_snapshot_notification(replace(stale, consecutive_stale_reads=count))
+        app.notify_device_fault.assert_not_called()
+        chronic = replace(stale, consecutive_stale_reads=STALE_READ_HOLD_THRESHOLD)
+        app.handle_device_snapshot_notification(chronic)
+        app.notify_device_fault.assert_called_once_with(chronic)
 
 
 if __name__ == "__main__":

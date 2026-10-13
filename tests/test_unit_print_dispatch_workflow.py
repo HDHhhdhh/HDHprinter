@@ -35,6 +35,8 @@ class ScriptedMonitor:
         self.acceptance_timeout = acceptance_timeout
         self.fresh_timeout = fresh_timeout
         self.hold_steps = ["held", "resumed"] if hold else []
+        self.stale_steps = []
+        self.stale_count = 0
         self.events = []
         self.accepted_tokens = []
         self.sent_tokens = []
@@ -87,6 +89,17 @@ class ScriptedMonitor:
     def wait_for_change(self, _observed_at, _timeout):
         if self.fresh_timeout:
             return self._snapshot
+        if self.pending_tokens and self.stale_steps:
+            step = self.stale_steps.pop(0)
+            self.events.append((step, tuple(self.pending_tokens)))
+            if step == "stale":
+                self.stale_count += 1
+                self._snapshot = replace(
+                    DeviceSnapshot.unavailable("timeout", observed_at=self._snapshot.observed_at + timedelta(seconds=1)),
+                    consecutive_stale_reads=self.stale_count,
+                )
+                return self._snapshot
+            self.stale_count = 0
         health = DeviceHealth.READY
         errors = ()
         state = DeviceJobState.QUEUED
@@ -529,6 +542,40 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertEqual(4, len(set(self.monitor.sent_tokens)))
         names = [record["event"] for record in records]
         self.assertLess(names.index("device_dispatch_held"), names.index("device_dispatch_resumed"))
+        self.assertTrue(records[-1]["physical_output_verified"])
+
+    def test_single_stale_read_pauses_new_submissions_without_operator_hold(self):
+        self.monitor.stale_steps = ["stale", "recovered"]
+        records = self.run_worker()
+        self.app.enter_device_hold.assert_not_called()
+        self.assertNotIn("device_dispatch_held", [record["event"] for record in records])
+        events = [event[0] for event in self.monitor.events]
+        self.assertEqual(["send", "acknowledge"] * 2 + ["stale", "recovered"], events[:6])
+        self.assertEqual(4, len(set(self.monitor.sent_tokens)))
+        self.assertTrue(records[-1]["physical_output_verified"])
+
+    def test_consecutive_stale_hold_auto_resumes_without_click_or_duplicate_send(self):
+        self.monitor.stale_steps = ["stale", "stale", "stale", "recovered"]
+        records = self.run_worker()
+        self.app.enter_device_hold.assert_called_once()
+        held = next(record for record in records if record["event"] == "device_dispatch_held")
+        self.assertEqual("stale", held["hold_kind"])
+        self.assertIn("device_dispatch_resumed", [record["event"] for record in records])
+        events = [event[0] for event in self.monitor.events]
+        self.assertEqual(["send", "acknowledge"] * 2 + ["stale"] * 3 + ["recovered"], events[:8])
+        self.assertEqual(4, len(set(self.monitor.sent_tokens)))
+        self.assertTrue(records[-1]["physical_output_verified"])
+
+    def test_stale_hold_followed_by_device_fault_keeps_explicit_resume(self):
+        self.monitor.stale_steps = ["stale", "stale", "stale", "recovered"]
+        self.monitor.hold_steps = ["held", "resumed"]
+        records = self.run_worker()
+        held = [record for record in records if record["event"] == "device_dispatch_held"]
+        self.assertEqual(["stale", "fault"], [record["hold_kind"] for record in held])
+        self.assertEqual(2, self.app.enter_device_hold.call_count)
+        events = [event[0] for event in self.monitor.events]
+        self.assertLess(events.index("held"), events.index("resumed"))
+        self.assertEqual(4, len(set(self.monitor.sent_tokens)))
         self.assertTrue(records[-1]["physical_output_verified"])
 
     def test_first_dispatch_requires_a_fresh_device_observation(self):

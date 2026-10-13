@@ -61,6 +61,7 @@ from unit_print_device_scheduler import (
     remove_dispatch_copy,
 )
 from unit_print_device_state import DeviceHealth, DeviceJob, DeviceJobState, DeviceSnapshot
+from unit_print_dispatch_state import STALE_READ_HOLD_THRESHOLD
 from unit_print_device_ui import build_device_status_view
 from unit_print_theme import WORKBENCH_COLORS, QUEUE_CARD_RADIUS, apply_workbench_styles
 from unit_print_typography import korean_label
@@ -1261,6 +1262,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.device_resume_event.set()
         self.device_hold_active = False
         self.device_hold_message = ""
+        self.device_hold_connectivity_only = False
         self.device_monitor: PrinterDeviceMonitor | None = None
         configured_device_monitor = self.config.get("device_monitor", {})
         self.device_monitor_config: dict[str, object] = (
@@ -10373,7 +10375,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if bad:
             if gate is not None:
                 gate.clear("printer-recovery")
-            if self.is_printing or previously_good:
+            if (self.is_printing or previously_good) and (
+                not self.is_printing
+                or not snapshot.connectivity_only
+                or snapshot.consecutive_stale_reads >= STALE_READ_HOLD_THRESHOLD
+            ):
                 self.notify_device_fault(snapshot)
         elif current in {DeviceHealth.READY, DeviceHealth.BUSY}:
             previously_bad = previous in {
@@ -10387,7 +10393,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             ):
                 action = (
                     "앱에서 [해결 후 이어서]를 눌러 남은 작업을 계속해 주세요."
-                    if self.device_hold_active
+                    if self.device_hold_active and not getattr(self, "device_hold_connectivity_only", False)
                     else "앱이 남은 인쇄 상태 확인을 계속합니다."
                 )
                 self.notify_operator(
@@ -10573,8 +10579,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         def update() -> None:
             self.device_hold_active = True
             self.device_hold_message = message
-            self.set_status("프린터 오류 / 인쇄 일시 중지")
-            self.set_current_work(f"현재 작업: {message} · 해결 후 이어서 눌러 주세요")
+            self.device_hold_connectivity_only = snapshot.connectivity_only
+            action = "연결 복구 시 자동 재개" if snapshot.connectivity_only else "해결 후 이어서 눌러 주세요"
+            self.set_status("프린터 연결 대기 / 인쇄 일시 중지" if snapshot.connectivity_only else "프린터 오류 / 인쇄 일시 중지")
+            self.set_current_work(f"현재 작업: {message} · {action}")
             self.refresh_print_action_buttons()
             self.notify_device_fault(snapshot)
 
@@ -10600,6 +10608,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             return
         self.device_hold_active = False
         self.device_hold_message = ""
+        self.device_hold_connectivity_only = False
         self.device_fault_notification_active = False
         gate = getattr(self, "notification_gate", None)
         if gate is not None:

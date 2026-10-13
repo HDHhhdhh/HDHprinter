@@ -24,7 +24,7 @@ from unit_print_domain import (
     resolve_exam_print_settings,
 )
 from unit_print_device_state import DeviceHealth, DeviceJobState
-from unit_print_dispatch_state import RollingDispatchWindow
+from unit_print_dispatch_state import DeviceDispatchHold, RollingDispatchWindow
 from unit_print_eta import (
     ActivePrintTime, CompletionTimeProjection, EtaWorkload, PrintEtaObservation,
     estimate_workloads_seconds, estimated_sheets,
@@ -989,6 +989,7 @@ class PrintExecutionMixin:
         completed_count = 0
         phase = "rolling_preparation"
         paused_for_device = False
+        device_hold = DeviceDispatchHold()
         full_snapshot_pause_active = False
         active_block_uid: int | None = None
 
@@ -1072,8 +1073,9 @@ class PrintExecutionMixin:
             )
             if paused_for_device:
                 reason = self.device_hold_message or "프린터 오류가 아직 해제되지 않았습니다"
+                action = "연결 복구 시 자동 재개" if device_hold.kind == "stale" else "해결 후 이어서 눌러 주세요"
                 self.set_current_work(
-                    f"현재 작업: {reason} · 해결 후 이어서 눌러 주세요 · {status}"
+                    f"현재 작업: {reason} · {action} · {status}"
                 )
             else:
                 self.set_current_work(f"현재 작업: {status}")
@@ -1208,8 +1210,7 @@ class PrintExecutionMixin:
                     result = failed_job.result if failed_job is not None else "알 수 없음"
                     raise RuntimeError(f"{label}의 프린터 작업 결과가 실패입니다: {result}")
 
-                device_fault = not snapshot.can_dispatch or bool(reconciled.held)
-                if device_fault and not paused_for_device:
+                if device_hold.observe(snapshot, job_held=bool(reconciled.held)):
                     timing_contaminated = True
                     paused_for_device = True
                     self.device_resume_event.clear()
@@ -1218,15 +1219,30 @@ class PrintExecutionMixin:
                         "device_dispatch_held",
                         outstanding_tokens=[entry.token for entry in window.entries],
                         reason=snapshot.status_text,
+                        hold_kind=device_hold.kind,
                     )
 
                 if paused_for_device:
-                    healthy = snapshot.can_dispatch and not reconciled.held
-                    if healthy and self.device_resume_event.is_set():
+                    if device_hold.can_resume(
+                        snapshot,
+                        operator_resume=self.device_resume_event.is_set(),
+                        job_held=bool(reconciled.held),
+                    ):
                         # Reconciliation above always happens before refilling.
                         paused_for_device = False
-                        self.device_hold_active = False
-                        self.device_hold_message = ""
+                        device_hold.resume()
+                        self.device_resume_event.set()
+
+                        def clear_hold_display() -> None:
+                            # Queue after enter_device_hold's UI callback so a
+                            # fast connectivity recovery cannot leave a stale hold.
+                            self.device_hold_active = False
+                            self.device_hold_message = ""
+                            self.device_hold_connectivity_only = False
+                            self.set_status("실제 인쇄 확인 중")
+                            self.refresh_print_action_buttons()
+
+                        self.root.after(0, clear_hold_display)
                         self.log(
                             f"장비 상태 재조정 완료: 내부 {window.outstanding_count}건을 유지한 채 보충 재개"
                         )
@@ -1414,12 +1430,14 @@ class PrintExecutionMixin:
                             errors=(held_message,),
                         )
                         paused_for_device = True
+                        device_hold.kind = "fault"
                         self.device_resume_event.clear()
                         self.enter_device_hold(held_snapshot)
                         self.record_history(
                             "device_dispatch_held",
                             outstanding_tokens=[entry.token for entry in window.entries],
                             reason=held_message,
+                            hold_kind="fault",
                         )
                         monitor.refresh_now()
                         break

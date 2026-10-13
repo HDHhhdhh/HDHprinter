@@ -7,6 +7,48 @@ from dataclasses import dataclass
 from unit_print_device_state import DeviceJobState, DeviceSnapshot
 
 
+STALE_READ_HOLD_THRESHOLD = 3
+
+
+class DeviceDispatchHold:
+    """Debounce connectivity holds without permitting stale dispatch."""
+
+    def __init__(self) -> None:
+        self.kind = ""
+        self._stale_reads = 0
+        self._last_observed_at = None
+
+    def observe(self, snapshot: DeviceSnapshot, *, job_held: bool = False) -> bool:
+        """Return True only when entering a hold or escalating stale to fault."""
+        previous = self.kind
+        if snapshot.connectivity_only and not job_held:
+            if snapshot.consecutive_stale_reads:
+                # This count includes normal reads the worker may have missed.
+                self._stale_reads = snapshot.consecutive_stale_reads
+            elif snapshot.observed_at != self._last_observed_at:
+                self._stale_reads += 1
+            if self._stale_reads >= STALE_READ_HOLD_THRESHOLD and not self.kind:
+                self.kind = "stale"
+        else:
+            self._stale_reads = 0
+            if not snapshot.can_dispatch or job_held:
+                self.kind = "fault"
+        self._last_observed_at = snapshot.observed_at
+        return self.kind != previous
+
+    def can_resume(self, snapshot: DeviceSnapshot, *, operator_resume: bool, job_held: bool = False) -> bool:
+        return (
+            bool(self.kind)
+            and snapshot.can_dispatch
+            and not job_held
+            and (self.kind == "stale" or operator_resume)
+        )
+
+    def resume(self) -> None:
+        self.kind = ""
+        self._stale_reads = 0
+
+
 @dataclass(frozen=True)
 class RollingEntry:
     job_id: str
