@@ -10,7 +10,7 @@ import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
 
@@ -129,6 +129,41 @@ def safe_target(root: Path, relative_path: str) -> Path:
     return target
 
 
+def normalize_asset_path(value: str | Path) -> str:
+    normalized = normalize_relative_path(value)
+    # The release's one fixed PDF lives beside the app, not in data/.
+    if normalized == "unit_print_separator_a4.pdf":
+        return normalized
+    parts = normalized.split("/")
+    if (
+        len(parts) < 2
+        or parts[0] != "data"
+        or PurePosixPath(normalized).suffix.casefold() != ".pdf"
+        or any(
+            part.endswith((" ", "."))
+            or PureWindowsPath(part).is_reserved()
+            or any(ord(char) < 32 or char in '<>:"|?*' for char in part)
+            for part in parts
+        )
+    ):
+        raise ValueError(f"Unsafe PDF asset path: {value}")
+    return normalized
+
+
+def safe_asset_target(root: Path, relative_path: str) -> Path:
+    normalized = normalize_asset_path(relative_path)
+    target = safe_target(root, normalized)
+    if normalized == "unit_print_separator_a4.pdf":
+        if target != root.resolve() / normalized:
+            raise ValueError(f"Asset path redirects the fixed separator: {relative_path}")
+        return target
+    try:
+        target.relative_to(root.resolve() / "data")
+    except ValueError as exc:
+        raise ValueError(f"Asset path escapes the data directory: {relative_path}") from exc
+    return target
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as input_file:
@@ -157,7 +192,7 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 def entry_map(entries: Iterable[AssetEntry]) -> dict[str, AssetEntry]:
     result: dict[str, AssetEntry] = {}
     for entry in entries:
-        relative_path = normalize_relative_path(entry.relative_path)
+        relative_path = normalize_asset_path(entry.relative_path)
         key = relative_path.casefold()
         if key in result:
             raise ValueError(f"Duplicate asset path: {relative_path}")
@@ -393,7 +428,7 @@ def build_pull_plan(root: Path, entries: Iterable[AssetEntry]) -> PullPlan:
     missing_base: list[str] = []
     unchanged_overlay: list[str] = []
     for entry in sorted(entries, key=lambda item: item.relative_path.casefold()):
-        target = safe_target(root, entry.relative_path)
+        target = safe_asset_target(root, entry.relative_path)
         if entry.origin == "base":
             if not local_file_matches(target, entry):
                 missing_base.append(entry.relative_path)
@@ -777,12 +812,12 @@ def command_pull(args: argparse.Namespace) -> int:
             entries_by_path = {entry.relative_path.casefold(): entry for entry in entries}
             for relative_path in plan.download_paths:
                 entry = entries_by_path[relative_path.casefold()]
-                incoming_path = safe_target(incoming / "overlay", relative_path)
+                incoming_path = safe_asset_target(incoming / "overlay", relative_path)
                 if not local_file_matches(incoming_path, entry):
                     raise ValueError(f"Downloaded asset failed SHA-256 verification: {relative_path}")
             for relative_path in plan.download_paths:
-                incoming_path = safe_target(incoming / "overlay", relative_path)
-                target = safe_target(root, relative_path)
+                incoming_path = safe_asset_target(incoming / "overlay", relative_path)
+                target = safe_asset_target(root, relative_path)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 temporary_target = target.with_name(f"{target.name}.asset-sync.tmp")
                 shutil.copy2(incoming_path, temporary_target)

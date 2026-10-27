@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -125,6 +126,91 @@ class LocalAssetChannel:
 
 
 class QuickPrinterAssetSyncWorkflowTests(unittest.TestCase):
+    def test_registered_root_separator_remains_updateable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            channel = LocalAssetChannel(Path(temporary))
+            channel.relative_path = "unit_print_separator_a4.pdf"
+
+            channel.publish(b"updated separator", "v1-separator")
+            self.assertEqual(0, channel.pull())
+
+            self.assertEqual(
+                b"updated separator",
+                (channel.installed / channel.relative_path).read_bytes(),
+            )
+
+    def test_manifest_cannot_replace_app_files_or_use_windows_special_paths(self) -> None:
+        for relative_path in (
+            "unit_print_manager.py", "run_unit_print_manager.cmd",
+            "scripts/install_quick_printer.ps1", "unit_print_manager_config.json",
+            ".quick_printer_asset_manifest.json", "DATA/test/lesson.pdf",
+            "data/test/code.py", "data/test/code.PY", "data/../unit_print_manager.py",
+            "data/test/code.py:payload.pdf", "data/test./lesson.pdf",
+            "data/test /lesson.pdf", "data/NUL.pdf", "data/test/\nlesson.pdf",
+            "C:/data/lesson.pdf", "//server/share/data/lesson.pdf",
+        ):
+            with self.subTest(path=relative_path), tempfile.TemporaryDirectory() as temporary:
+                channel = LocalAssetChannel(Path(temporary))
+                channel.pull()
+                app_source = channel.installed / "unit_print_manager.py"
+                app_source.write_bytes(b"original app source")
+                snapshots = {
+                    path.relative_to(channel.installed): path.read_bytes()
+                    for path in channel.installed.rglob("*") if path.is_file()
+                }
+                malicious = sync.AssetEntry(
+                    "test", relative_path, 3, hashlib.sha256(b"new").hexdigest(), "overlay",
+                )
+                manifest = channel.read_manifest()
+                manifest["assets"] = [malicious.to_json()]
+                digest_entry = malicious.to_json()
+                digest_entry.pop("origin")
+                manifest["asset_set_sha256"] = sync.json_sha256({"assets": [digest_entry]})
+                sync.write_json_atomic(channel.remote / "latest_assets.json", manifest)
+                channel.commands.clear()
+
+                with self.assertRaisesRegex(ValueError, "Unsafe .*asset path"):
+                    channel.pull()
+
+                self.assertEqual(snapshots, {
+                    path.relative_to(channel.installed): path.read_bytes()
+                    for path in channel.installed.rglob("*") if path.is_file()
+                })
+                self.assertFalse(any(command[0] == "copy" for command in channel.commands))
+
+    def test_data_junction_into_app_directory_is_rejected_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            channel = LocalAssetChannel(Path(temporary))
+            app_directory = channel.installed / "scripts"
+            app_directory.mkdir()
+            sentinel = app_directory / "lesson.pdf"
+            sentinel.write_bytes(b"not an updateable asset")
+            junction = channel.installed / "data" / "linked"
+            if os.name == "nt":
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(junction), str(app_directory)],
+                    capture_output=True, check=True,
+                )
+            else:
+                junction.symlink_to(app_directory, target_is_directory=True)
+            try:
+                malicious = sync.AssetEntry(
+                    "test", "data/linked/lesson.pdf", 3,
+                    hashlib.sha256(b"new").hexdigest(), "overlay",
+                )
+                channel.write_manifest("linked", malicious)
+
+                with self.assertRaisesRegex(ValueError, "escapes the data directory"):
+                    channel.pull()
+
+                self.assertEqual(b"not an updateable asset", sentinel.read_bytes())
+                self.assertFalse(any(command[0] == "copy" for command in channel.commands))
+            finally:
+                if os.name == "nt":
+                    junction.rmdir()
+                else:
+                    junction.unlink()
+
     def test_baseline_overlay_baseline_roundtrip_same_and_different_sizes(self) -> None:
         for updated_content in (b"new", b"new content with different size"):
             with self.subTest(updated_content=updated_content), tempfile.TemporaryDirectory() as temporary:
