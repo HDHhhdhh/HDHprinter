@@ -2263,6 +2263,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.update_preview()
         self.refresh_shortcut_help()
 
+    def handle_name_separator_shortcut(self, _event: tk.Event) -> str:
+        return self.run_keyboard_once(
+            "toggle-name-separator",
+            lambda: self.toggle_boolean_var(self.name_separator_page_var, self.handle_name_separator_toggle),
+        )
+
     def resolve_ui_font_family(self) -> str:
         """Prefer the requested Yoon Gothic face, with an installed Korean fallback."""
         try:
@@ -3062,7 +3068,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             "이름 구분지",
             self.name_separator_page_var,
             command=self.handle_name_separator_toggle,
-            help_text="켜짐: 이름 묶음 앞에 학생 이름이 상단 중앙에 표시된 A4 세로 한 장을 추가합니다.",
+            help_text="Ctrl+R로 켜고 끕니다. 켜짐: 이름 묶음 앞에 학생 이름이 상단 중앙에 표시된 A4 세로 한 장을 추가합니다.",
         ).pack(side="left", padx=(0, 14))
         ttk.Separator(option_bar, orient="vertical").pack(side="left", fill="y", padx=(0, 14))
         ttk.Label(option_bar, text="전송 묶음", style="InsetText.TLabel").pack(side="left", padx=(0, 6))
@@ -8987,6 +8993,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.root.bind("<Control-C>", self.handle_ctrl_c_shortcut)
         self.root.bind("<Control-v>", self.handle_ctrl_v_shortcut)
         self.root.bind("<Control-V>", self.handle_ctrl_v_shortcut)
+        for sequence in ("<Control-r>", "<Control-R>"):
+            self.root.bind(sequence, self.handle_name_separator_shortcut)
         self.root.bind("<Escape>", self.handle_escape_shortcut)
         self.root.bind("<Control-s>", self.handle_save_shortcut)
         self.root.bind("<Control-S>", self.handle_save_shortcut)
