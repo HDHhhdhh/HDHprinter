@@ -123,7 +123,8 @@ def isolated_app(stack: ExitStack, temporary: Path, phase_timings: dict[str, lis
         # Cancel them before destroying this interpreter to avoid stale callbacks
         # being reported while the next constructor's event loop runs.
         for after_id in root.tk.splitlist(root.tk.call("after", "info")):
-            root.after_cancel(after_id)
+            # Cancel the Tcl timer without deregistering a child widget's command.
+            root.tk.call("after", "cancel", after_id)
     stack.callback(close)
     # These are geometry only. Tcl Canvas drawing and tkfont.Font.measure stay real.
     stack.enter_context(patch.object(app.queue_canvas, "winfo_width", return_value=520))

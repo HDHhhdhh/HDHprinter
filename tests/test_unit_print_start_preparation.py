@@ -224,20 +224,16 @@ class PrintStartPreparationTests(unittest.TestCase):
         self.binding_reader.assert_called_once()
         self.assertEqual(id(self.block), self.app.print_pending_jobs[0].block_uid)
 
-    def test_waiting_for_forecast_does_not_block_ui(self):
+    def test_pending_forecast_does_not_delay_print_confirmation(self):
         future = Future()
         self.app.resource_estimate_future = future
         self.app.resource_estimate_revision = 1
         self.app.resource_estimate_request_key = ("forecast",)
         self.app.start_print_thread()
-        self.app.root.pump_until(lambda: self.binding_reader.called)
-        self.confirm.assert_not_called()
-        marker = []
-        self.app.root.after(0, lambda: marker.append(True))
-        self.app.root.pump_until(lambda: bool(marker))
-        future.set_result(SimpleNamespace(display_text="ready", tone="secondary", detail_text="forecast"))
         self.finish()
-        self.app.set_resource_estimate_text.assert_any_call("ready", "secondary")
+        self.confirm.assert_called_once()
+        self.assertFalse(future.done())
+        self.assertIn("계산 결과를 아직 확인할 수 없습니다", self.confirm.call_args.args[1])
         self.assertIn("예상 완료 시간 계산 중", self.app.set_resource_estimate_text.call_args.args[0])
 
     def test_changed_block_selection_or_options_aborts_before_confirmation(self):

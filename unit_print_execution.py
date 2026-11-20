@@ -27,7 +27,7 @@ from unit_print_device_state import DeviceHealth, DeviceJobState
 from unit_print_dispatch_state import DeviceDispatchHold, RollingDispatchWindow
 from unit_print_eta import (
     ActivePrintTime, CompletionTimeProjection, EtaWorkload, PrintEtaObservation,
-    estimate_workloads_seconds, estimated_sheets,
+    active_start_monotonic, estimate_workloads_seconds, estimated_sheets,
 )
 from unit_print_history import HistoryWriteError
 from unit_print_history_events import block_history_data, job_history_data
@@ -598,9 +598,10 @@ class PrintExecutionMixin:
         estimate = None
         estimate_error = None
         future = request.resource_future
-        if request.mode not in {"append", "selected"} and not options.dry_run and future is not None:
+        if (request.mode not in {"append", "selected"} and not options.dry_run
+                and future is not None and future.done()):
             try:
-                estimate = future.result(timeout=15.0)
+                estimate = future.result()
             except Exception as error:
                 estimate_error = error
         if request.cancel.is_set():
@@ -977,6 +978,7 @@ class PrintExecutionMixin:
         previous_completion_monotonic: float | None = None
         first_eta_deadline_monotonic: float | None = None
         first_eta_job_count: int | None = None
+        eta_checkpoints: dict[int, tuple[float, float, float]] = {}
         timing_contaminated = False
         progress_eta_key: object | None = None
         progress_eta_projection: CompletionTimeProjection | None = None
@@ -1040,13 +1042,14 @@ class PrintExecutionMixin:
                 # progress update. Backdate only an identified printing job,
                 # bounded by submission and the preceding physical completion.
                 if previous_completed_at is not None or printing_id == first_submitted_job_id:
-                    started_at = max(printing_job.started_at, previous_completed_at) if previous_completed_at else printing_job.started_at
-                    age = max(0.0, (datetime.now().astimezone() - started_at).total_seconds())
-                    started_monotonic = max(meta.submitted_at_monotonic, now_monotonic - age)
-                    if previous_completion_monotonic is not None:
-                        # Do not let a different device clock subtract queue
-                        # waiting from a later job's unfinished work.
-                        started_monotonic = max(started_monotonic, previous_completion_monotonic)
+                    previous = (
+                        (previous_completed_at, previous_completion_monotonic)
+                        if previous_completed_at is not None and previous_completion_monotonic is not None else None
+                    )
+                    started_monotonic = active_start_monotonic(
+                        printing_job.started_at, submitted_at=meta.submitted_at_monotonic,
+                        now=now_monotonic, local_wall_now=datetime.now().astimezone(), previous_completion=previous,
+                    )
             active_print_time.observe(printing_id, now_monotonic, started_at=started_monotonic)
             eta = estimate_workloads_seconds(
                 tuple(EtaWorkload(sheet_count(job), job.copies, duplex=run_options.duplex) for job in unfinished),
@@ -1055,15 +1058,26 @@ class PrintExecutionMixin:
             )
             remaining_ids = tuple(sorted(job.job_id for job in unfinished))
             complete = not any(job_id in unknown_sheet_job_ids for job_id in remaining_ids)
-            if first_eta_deadline_monotonic is None and complete and not paused_for_device and remaining_ids:
+            status_pending = not snapshot.can_dispatch
+            if (first_eta_deadline_monotonic is None and complete and not status_pending
+                    and not paused_for_device and remaining_ids):
                 first_eta_deadline_monotonic = now_monotonic + eta.seconds_expected
                 first_eta_job_count = len(remaining_ids)
+            if (complete and not status_pending and not paused_for_device and remaining_ids
+                    and first_eta_job_count == total_jobs):
+                for percent in (25, 50, 75):
+                    if percent not in eta_checkpoints and completed_count * 100 >= percent * total_jobs:
+                        eta_checkpoints[percent] = tuple(
+                            now_monotonic + seconds
+                            for seconds in (eta.seconds_low, eta.seconds_expected, eta.seconds_high)
+                        )
             observation = PrintEtaObservation(
                 run_id=display_run_id, eta=eta, observed_at=datetime.now().astimezone(),
                 remaining_job_ids=remaining_ids, rate_samples=samples,
                 remaining_sheets=remaining_sheets, held=paused_for_device,
-                complete=complete, timing_samples=timings,
-                projection_key=(display_run_id, remaining_ids, timings, paused_for_device, complete, printing_id),
+                complete=complete, timing_samples=timings, status_pending=status_pending,
+                projection_key=(display_run_id, remaining_ids, timings, paused_for_device,
+                                complete, status_pending, printing_id),
             )
             if observation.anchor_key != progress_eta_key:
                 progress_eta_projection = CompletionTimeProjection(eta, observation.observed_at)
@@ -1170,7 +1184,6 @@ class PrintExecutionMixin:
                     if device_job is None:
                         continue
                     completed_count += 1
-                    previous_completion_monotonic = time.monotonic()
                     completed_job_ids.add(meta.job.job_id)
                     elapsed_seconds = max(0.0, time.monotonic() - meta.submitted_at_monotonic)
                     timing = None
@@ -1181,8 +1194,11 @@ class PrintExecutionMixin:
                             copies=meta.job.copies, duplex=run_options.duplex,
                             previous_completed_at=previous_completed_at,
                         )
-                    if device_job.ended_at is not None:
-                        previous_completed_at = max(previous_completed_at, device_job.ended_at) if previous_completed_at is not None else device_job.ended_at
+                    if device_job.ended_at is not None and (
+                        previous_completed_at is None or device_job.ended_at >= previous_completed_at
+                    ):
+                        previous_completed_at = device_job.ended_at
+                        previous_completion_monotonic = time.monotonic()
                     self.record_history(
                         "job_physically_completed",
                         required=True,
@@ -1491,15 +1507,20 @@ class PrintExecutionMixin:
                 f"현재 작업: 실제 완료 {completed_count}/{completed_count} · "
                 "프린터 내부 0건 · 미전송 0건"
             )
+            finish_monotonic = time.monotonic()
             self.record_history(
                 "run_finished",
                 submitted_jobs=submitted_count,
                 completed_jobs=completed_count,
                 outcome="device_jobs_completed",
                 physical_output_verified=True,
-                eta_initial_error_seconds=(round(time.monotonic() - first_eta_deadline_monotonic, 3)
+                eta_initial_error_seconds=(round(finish_monotonic - first_eta_deadline_monotonic, 3)
                                            if first_eta_deadline_monotonic is not None else None),
                 eta_initial_job_count=first_eta_job_count,
+                eta_checkpoint_errors={
+                    str(percent): [round(finish_monotonic - deadline, 3) for deadline in deadlines]
+                    for percent, deadlines in eta_checkpoints.items()
+                },
                 dispatch_window_size=window.max_outstanding,
                 printers=sorted(used_printers),
             )

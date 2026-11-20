@@ -319,6 +319,7 @@ class OrderBlockTests(unittest.TestCase):
         row = order_row()
         app = PrintManagerApp.__new__(PrintManagerApp)
         app.order_csv_result = OrderCsvResult((row,), (), "utf-8-sig")
+        app.order_csv_list = Mock()
         app.blocks = []
         app.resolve_order_csv_blocks = Mock(
             return_value=([], [OrderCsvIssue(2, "백지리뷰", "파일 없음")])
@@ -332,6 +333,7 @@ class OrderBlockTests(unittest.TestCase):
         self.assertEqual([], app.blocks)
         app.push_undo_state.assert_not_called()
         warning.assert_called_once()
+        app.order_csv_list.see.assert_called_once_with(1)
 
     def test_valid_order_rows_are_appended_in_one_undo_step(self) -> None:
         first = PrintBlock(
@@ -348,6 +350,8 @@ class OrderBlockTests(unittest.TestCase):
         rows = (order_row(row_number=2), order_row(row_number=3, order_id="1002"))
         app = PrintManagerApp.__new__(PrintManagerApp)
         app.order_csv_result = OrderCsvResult(rows, (), "utf-8-sig")
+        app.order_csv_status_var = FakeVariable("")
+        app.order_csv_add_button = Mock()
         app.order_csv_path = Path("orders.csv")
         app.blocks = []
         app.block_status_by_id = {}
@@ -359,6 +363,8 @@ class OrderBlockTests(unittest.TestCase):
         app.log = Mock()
         app.clear_order_csv = Mock()
 
+        app.refresh_order_csv_list()
+        app.order_csv_add_button.configure.assert_called_once_with(text="전체 2행 추가")
         added = app.add_order_csv_blocks()
 
         self.assertTrue(added)
@@ -392,6 +398,7 @@ class OrderBlockTests(unittest.TestCase):
         rows = tuple(order_row(row_number=number) for number in range(2, 6))
         app = PrintManagerApp.__new__(PrintManagerApp)
         app.order_csv_result = OrderCsvResult(rows, (), "utf-8-sig")
+        app.order_csv_status_var = FakeVariable("")
         app.order_csv_path = Path("orders.csv")
         app.blocks = [existing]
         app.block_status_by_id = {id(existing): "대기"}

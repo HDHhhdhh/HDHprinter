@@ -233,7 +233,7 @@ from unit_print_test_catalog import (
     test_filter_choices,
     test_filter_label,
 )
-from unit_print_paths import DATA_ROOT as LOCAL_DATA_ROOT, select_configured_root
+from unit_print_paths import DATA_ROOT as LOCAL_DATA_ROOT, select_unit_root
 
 try:
     import ttkbootstrap
@@ -1332,7 +1332,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.apply_app_icon()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        initial_root = select_configured_root(
+        initial_root = select_unit_root(
             self.config.get("root_dir"),
             portable_root=BUNDLED_DATA_ROOT / "단원평가",
             legacy_root=LEGACY_DEFAULT_ROOT,
@@ -1375,6 +1375,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.apex_selected_numbers_var = StringVar()
         self.apex_copies_var = IntVar(value=1)
         self.apex_status_var = StringVar(value="APEX 자료를 선택하세요.")
+        self.recent_apex_selection: dict[str, tuple[ApexDocument, tuple[str, ...]]] = {}
         self.able_subject_var = StringVar()
         self.able_document_kind_var = StringVar(value="교재 + 백지리뷰")
         self.able_mode_var = StringVar(value="차시별")
@@ -1821,7 +1822,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             if observation.anchor_key != getattr(self, "resource_completion_key", None):
                 self.resource_completion_projection = CompletionTimeProjection(observation.eta, observation.observed_at)
                 self.resource_completion_key = observation.anchor_key
-            tone = "danger" if not observation.complete or observation.held else "waiting" if not observation.remaining_job_ids else "success"
+            tone = "success"
+            if not observation.remaining_job_ids or observation.status_pending:
+                tone = "waiting"
+            if not observation.complete or observation.held:
+                tone = "danger"
             estimate = getattr(self, "latest_resource_estimate", None)
             if isinstance(estimate, PrintResourceEstimate) and estimate.tone in {"warning", "danger"}:
                 tone = "danger"
@@ -2130,33 +2135,6 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ):
             return "\n\n예상 자원: 계산 결과를 아직 확인할 수 없습니다."
         return f"\n\n{self.resource_estimate_detail_text()}"
-
-    def complete_resource_estimate_for_confirmation(self, timeout: float = 15.0) -> None:
-        """Finish the already scheduled forecast before the final print prompt."""
-
-        if (
-            getattr(self, "latest_resource_estimate", None) is not None
-            and getattr(self, "latest_resource_estimate_key", None)
-            == getattr(self, "resource_estimate_request_key", None)
-        ):
-            return
-        self.schedule_resource_estimate()
-        future = getattr(self, "resource_estimate_future", None)
-        revision = getattr(self, "resource_estimate_revision", 0)
-        request_key = getattr(self, "resource_estimate_request_key", None)
-        if future is None or not hasattr(future, "result"):
-            return
-        try:
-            estimate = future.result(timeout=max(0.0, float(timeout)))
-        except Exception as exc:
-            self.log(f"인쇄 시작 전 자원 예측을 완료하지 못했습니다: {exc}")
-            return
-        if (
-            revision != getattr(self, "resource_estimate_revision", -1)
-            or request_key != getattr(self, "resource_estimate_request_key", None)
-        ):
-            return
-        self.adopt_resource_estimate(estimate, request_key)
 
     def refresh_toggle_buttons(self) -> None:
         for button, text, variable in self.toggle_buttons:
@@ -3486,7 +3464,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.order_csv_clear_button.grid(row=0, column=2, sticky="ew", padx=(5, 0))
         self.order_csv_add_button = ttk.Button(
             order_actions,
-            text="주문서 블록 추가",
+            text="전체 주문서 추가",
             style="Primary.TButton",
             command=self.add_order_csv_blocks,
         )
@@ -4065,11 +4043,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         token = self.reserve_block_commit()
 
         def commit() -> None:
-            self.push_undo_state(f"{kind} 블록 추가")
-            self.blocks.append(block)
-            self.block_status_by_id[id(block)] = "대기"
-            self.update_queue_view(select_index=len(self.blocks) - 1)
-            self.update_preview()
+            self.append_waiting_block(block, f"{kind} 블록 추가")
             if variables["copies"].get() == captured_copies:
                 variables["copies"].set(1)
             if variables["selected"].get() == captured_selected:
@@ -4259,6 +4233,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         )
         add_button.grid(row=0, column=2, sticky="e")
         self.bind_block_add_button(add_button, self.add_apex_material_block)
+        ttk.Button(
+            actions, text="최근 자료", style="SoftAction.TButton",
+            command=self.recall_recent_apex_selection,
+        ).grid(row=0, column=3, sticky="e", padx=(6, 0))
         status_label = korean_label(
             page,
             textvariable=self.apex_status_var,
@@ -5331,10 +5309,37 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             messagebox.showwarning(APP_TITLE, str(error))
             return False
         self.add_material_block(block)
+        document = self.current_apex_document()
+        if document is not None:
+            self.recent_apex_selection[document.variant] = (document, (
+                self.apex_part_var.get(), self.apex_start_var.get(),
+                self.apex_end_var.get(), self.apex_selected_numbers_var.get(),
+            ))
         self.clear_new_block_name()
         self.apex_copies_var.set(1)
         self.apex_selected_numbers_var.set("")
         return True
+
+    def recall_recent_apex_selection(self) -> None:
+        variant = self.active_apex_variant()
+        recent = self.recent_apex_selection.get(variant)
+        if recent is None:
+            self.apex_status_var.set("이 탭에서 추가한 최근 자료가 없습니다.")
+            return
+        document, (part, first, last, numbers) = recent
+        if self.apex_material_catalog.find(variant, document.subject, document.document_kind) != document:
+            self.apex_status_var.set("최근 자료가 변경되었습니다. 과목과 차시를 다시 선택해 주세요.")
+            return
+        self.apex_subject_var.set(document.subject)
+        self.apex_document_kind_var.set(document.document_kind)
+        self.apex_part_var.set(part)
+        self.refresh_apex_material_options()
+        if part == self.apex_part_var.get() == "차시 별":
+            if first in self.apex_start_combo["values"] and last in self.apex_end_combo["values"]:
+                self.apex_start_var.set(first)
+                self.apex_end_var.set(last)
+                self.apex_selected_numbers_var.set(numbers)
+        self.refresh_apex_status()
 
     def current_textbook_edition(self) -> TextbookEdition | None:
         return self.textbook_catalog.find_edition(
@@ -9110,7 +9115,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 self.custom_drop_list.insert(END, f"{index:02d}. {path.name}")
         count = len(self.custom_pdf_files)
         if count:
-            self.custom_pdf_status_var.set(f"PDF {count}개 선택됨")
+            self.custom_pdf_status_var.set(f"PDF {count}개 선택 · 블록 1개로 추가")
         elif DND_FILES is None:
             self.custom_pdf_status_var.set("드래그앤드롭 패키지가 없어 [파일 선택]으로 PDF를 추가하세요.")
         else:
@@ -9262,6 +9267,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
     def refresh_order_csv_list(self) -> None:
         widget = getattr(self, "order_csv_list", None)
         result = self.order_csv_result
+        button = getattr(self, "order_csv_add_button", None)
+        if button is not None:
+            label = f"전체 {len(result.rows)}행 추가" if result.rows else "전체 주문서 추가"
+            button.configure(text=label)
         if widget is not None:
             widget.delete(0, END)
             for row in result.rows:
@@ -9283,8 +9292,19 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             )
         else:
             self.order_csv_status_var.set(
-                f"{order_csv_path.name} · 주문 {len(result.rows)}행 · {encoding_label}"
+                f"{order_csv_path.name} · 전체 {len(result.rows)}행 등록 대상 · {encoding_label}"
             )
+
+    def show_order_csv_issues(self, result: OrderCsvResult) -> None:
+        messagebox.showwarning(APP_TITLE, self.order_issue_message(result.issues))
+        widget = getattr(self, "order_csv_list", None)
+        if widget is not None and self.order_csv_result is result:
+            index = len(result.rows)
+            widget.selection_clear(0, END)
+            widget.selection_set(index)
+            widget.activate(index)
+            widget.see(index)
+            widget.focus_set()
 
     @staticmethod
     def order_issue_message(issues: list[OrderCsvIssue] | tuple[OrderCsvIssue, ...]) -> str:
@@ -9620,6 +9640,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         )
         if clear_source:
             self.clear_order_csv()
+            self.order_csv_status_var.set(f"{len(blocks)}개 추가 완료 · 작업 큐에서 Ctrl+Z로 취소")
 
     def add_order_csv_blocks(self) -> bool:
         if getattr(self, "order_build_pending", False):
@@ -9630,14 +9651,14 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             messagebox.showwarning(APP_TITLE, "먼저 대량 주문서 CSV를 선택해 주세요.")
             return False
         if result.issues:
-            messagebox.showwarning(APP_TITLE, self.order_issue_message(result.issues))
+            self.show_order_csv_issues(result)
             return False
         if not hasattr(self, "background_build_service"):
             blocks, issues = self.resolve_order_csv_blocks(result.rows)
             if issues:
                 self.order_csv_result = OrderCsvResult(result.rows, tuple(issues), result.encoding)
                 self.refresh_order_csv_list()
-                messagebox.showwarning(APP_TITLE, self.order_issue_message(issues))
+                self.show_order_csv_issues(self.order_csv_result)
                 return False
             if not blocks:
                 messagebox.showwarning(APP_TITLE, "추가할 주문 블록이 없습니다.")
@@ -9671,13 +9692,13 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 _ORDER_ROOT_OVERRIDE.reset(root_token)
 
         def finish(future: object) -> None:
-            self.order_build_pending = False
             try:
                 blocks, issues = future.result()  # type: ignore[attr-defined]
             except Exception as error:
                 message = str(error)
 
                 def show_error() -> None:
+                    self.order_build_pending = False
                     if self.order_csv_result is result:
                         self.refresh_order_csv_list()
                     messagebox.showwarning(APP_TITLE, message)
@@ -9689,6 +9710,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 issue_tuple = tuple(issues)
 
                 def show_issues() -> None:
+                    self.order_build_pending = False
                     if self.order_csv_result is result:
                         self.order_csv_result = OrderCsvResult(
                             result.rows,
@@ -9696,21 +9718,21 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                             result.encoding,
                         )
                         self.refresh_order_csv_list()
-                    messagebox.showwarning(APP_TITLE, self.order_issue_message(issue_tuple))
+                        self.show_order_csv_issues(self.order_csv_result)
+                    else:
+                        messagebox.showwarning(APP_TITLE, self.order_issue_message(issue_tuple))
 
                 self.complete_block_commit(token, show_issues)
                 return
             if not blocks:
-                self.complete_block_commit(
-                    token,
-                    lambda: messagebox.showwarning(APP_TITLE, "추가할 주문 블록이 없습니다."),
-                )
-                return
-            # Python's sort is stable: same-name rows retain CSV order and
-            # unnamed rows stay after every named group.
-            blocks.sort(key=lambda block: name_separator_order_key(block.name_separator_label))
+                def show_empty() -> None:
+                    self.order_build_pending = False
+                    messagebox.showwarning(APP_TITLE, "추가할 주문 블록이 없습니다.")
 
+                self.complete_block_commit(token, show_empty)
+                return
             def commit() -> None:
+                self.order_build_pending = False
                 self.commit_order_csv_blocks(
                     blocks,
                     source_name=source_name,
@@ -9763,6 +9785,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         captured_files = tuple(self.custom_pdf_files)
         captured_copies = self.custom_copies_var.get()
         captured_name = self.new_block_name_var.get()
+        picker = getattr(self, "custom_pdf_file_button", None)
+        original_focus = self.root.focus_get() if picker is not None else None
         try:
             block = self.apply_new_block_name(self.make_custom_pdf_block())
         except Exception as exc:
@@ -9782,6 +9806,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 self.clear_new_block_name()
             if tuple(self.custom_pdf_files) == captured_files:
                 self.clear_custom_pdfs()
+                if picker is not None and original_focus is not None and self.root.focus_get() is original_focus:
+                    picker.focus_set()
             self.log(
                 f"새 PDF 블록 추가: {block.file_count}개 / {block.copies}부 / "
                 f"{'묶음' if block.bundled else '일반'}"
@@ -10662,6 +10688,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if self.is_closing:
             return
         if not self.is_printing:
+            try:
+                self.save_current_config()
+            except Exception as error:
+                messagebox.showwarning(APP_TITLE, f"설정을 저장하지 못했습니다.\n\n{error}")
+                return
             self.is_closing = True
             self.cancel_source_paths_open()
             self.close_persistent_operator_alert(reset_dismissal=True)
@@ -10669,7 +10700,6 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 self.device_monitor.stop()
             self.close_pdf_work_services()
             self.close_taskbar_indicator()
-            self.save_current_config()
             self.schedule_queue_recovery_save("session_closed")
             self.record_history("session_closed", remaining_retry_count=len(self.retry_batch.jobs) if self.retry_batch else 0)
             self.close_queue_recovery()
@@ -12487,11 +12517,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         token = self.reserve_block_commit()
 
         def commit() -> None:
-            self.push_undo_state("블록 추가")
-            self.blocks.append(block)
-            self.block_status_by_id[id(block)] = "대기"
-            self.update_queue_view(select_index=len(self.blocks) - 1)
-            self.update_preview()
+            self.append_waiting_block(block, "블록 추가")
             if self.block_copies_var.get() == captured_copies:
                 self.block_copies_var.set(1)
             if self.unit_selected_numbers_var.get() == captured_numbers:
@@ -12503,6 +12529,13 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
         self.complete_block_commit(token, commit)
         return True
+
+    def append_waiting_block(self, block: PrintBlock, undo_label: str) -> None:
+        self.push_undo_state(undo_label)
+        self.blocks.append(block)
+        self.block_status_by_id[id(block)] = "대기"
+        self.update_queue_view(select_index=len(self.blocks) - 1)
+        self.update_preview()
 
     def bind_queue_mousewheel(self, _event: tk.Event) -> None:
         self.queue_canvas.bind_all("<MouseWheel>", self.on_queue_mousewheel)
@@ -12887,6 +12920,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.queue_status_var.set("작업 큐 저장 완료 · 큐 도구에서 수동 복구할 수 있습니다.")
 
     def close_queue_recovery(self) -> None:
+        after_id = getattr(self, "recovery_poll_after_id", None)
+        if after_id is not None:
+            self.root.after_cancel(after_id)
+            self.recovery_poll_after_id = None
         writer = getattr(self, "queue_recovery_writer", None)
         if writer is None:
             return
@@ -13747,10 +13784,17 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         )
         menu.add_separator()
         has_selection = bool(self.selected_block_indices)
+        partial_blocks = self.selected_blocks_for_partial_print()
+        if partial_blocks:
+            partial_label = f"선택 {len(partial_blocks)}개 인쇄"
+        elif self.is_printing or getattr(self, "retry_batch", None) is not None:
+            partial_label = "선택 인쇄 · 현재 작업 종료 후 가능"
+        else:
+            partial_label = "선택 인쇄 · 대기 블록을 선택하세요"
         menu.add_command(
-            label="선택 블록 인쇄",
+            label=partial_label,
             command=self.print_selected_queue_blocks,
-            state="normal" if self.selected_blocks_for_partial_print() else "disabled",
+            state="normal" if partial_blocks else "disabled",
         )
         menu.add_command(
             label="원본 경로 열기",

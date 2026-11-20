@@ -62,6 +62,7 @@ def report(history: Path, since: date | None) -> dict:
     jobs_by_run = defaultdict(dict)
     timings_by_run = defaultdict(dict)
     finishes = {}
+    clock_differences = []
     invalid_lines = 0
     for path in sorted(history.glob("????-??-??.jsonl")):
         with path.open(encoding="utf-8-sig") as stream:
@@ -96,6 +97,8 @@ def report(history: Path, since: date | None) -> dict:
                     ended = parse_timestamp(event.get("device_ended_at"))
                     if ended is not None:
                         last_device_completion[key] = max(ended, last_device_completion.get(key, ended))
+                        if stamp is not None and (since is None or stamp.date() >= since):
+                            clock_differences.append((stamp - ended).total_seconds())
                     observed = event.get("eta_service_seconds")
                     if number(observed) and observed > 0 and isinstance(event.get("job_id"), str):
                         timings_by_run[key][event["job_id"]] = observed
@@ -141,6 +144,11 @@ def report(history: Path, since: date | None) -> dict:
                               for percent in ("25", "50", "75")},
         "largest_submission_gap_seconds": max(gaps, default=None),
         "device_completion_to_confirmation_median_seconds": round(statistics.median(lag), 2) if lag else None,
+        "device_clock_ahead_observations": sum(value < 0 for value in clock_differences),
+        "device_time_observations": len(clock_differences),
+        "median_app_observation_minus_device_clock_seconds": (
+            round(statistics.median(clock_differences), 2) if clock_differences else None
+        ),
         "model_comparison_from_first_submission": compare_models(
             finishes, run_events, run_settings, first_submitted, jobs_by_run, timings_by_run,
         ),
@@ -181,7 +189,7 @@ def compare_models(finishes, run_events, run_settings, first_submitted, jobs_by_
         for sheets, copies, kind in jobs_by_run[key].values():
             estimate = estimate_workload_seconds(EtaWorkload(sheets, copies, duplex=duplex), samples)
             baseline += estimate.seconds_expected
-            comparable = separator_samples[(printer, duplex, kind, sheets, copies)]
+            comparable = separator_samples.get((printer, duplex, kind, sheets, copies), ())
             candidate += statistics.median(comparable) if len(comparable) >= 5 else estimate.seconds_expected
         duration = (end - start).total_seconds()
         size = "long" if len(jobs_by_run[key]) >= 50 else "short"

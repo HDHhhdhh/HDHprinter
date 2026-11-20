@@ -9,7 +9,7 @@ from pathlib import Path
 from unit_print_eta import (
     ActivePrintTime, CompletionTimeProjection, ETA_TIMING_CONFIG_KEY,
     ETA_TIMING_DEVICE_KEY, EtaTimingSample, EtaWorkload, PrintEtaObservation,
-    completed_job_timing, estimate_workloads_seconds, initialize_timing_samples,
+    active_start_monotonic, completed_job_timing, estimate_workloads_seconds, initialize_timing_samples,
     timing_device_key, validated_timing_samples,
 )
 from unit_print_manager import PrintManagerApp
@@ -93,6 +93,20 @@ class WorkloadEtaTests(unittest.TestCase):
 
 
 class ActivePrintTimeTests(unittest.TestCase):
+    def test_active_start_uses_device_relative_time_when_clocks_differ(self):
+        windows_now = datetime(2026, 11, 20, 12, 0, tzinfo=LOCAL)
+        device_previous = windows_now + timedelta(minutes=8)
+        self.assertEqual(96.0, active_start_monotonic(
+            device_previous + timedelta(seconds=6),
+            submitted_at=95.0, now=110.0, local_wall_now=windows_now,
+            previous_completion=(device_previous, 90.0),
+        ))
+        self.assertEqual(110.0, active_start_monotonic(
+            device_previous + timedelta(seconds=21),
+            submitted_at=95.0, now=110.0, local_wall_now=windows_now,
+            previous_completion=(device_previous, 90.0),
+        ))
+
     def test_first_observation_recovers_printing_during_next_pdf_preparation(self):
         clock = ActivePrintTime()
         clock.observe("a", 90, started_at=0)

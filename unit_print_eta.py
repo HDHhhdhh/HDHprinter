@@ -122,6 +122,25 @@ class ActivePrintTime:
         return self._elapsed.get(job_id, 0.0)
 
 
+def active_start_monotonic(
+    started_on_device: datetime,
+    *,
+    submitted_at: float,
+    now: float,
+    local_wall_now: datetime,
+    previous_completion: tuple[datetime, float] | None,
+) -> float:
+    if previous_completion is None:
+        age = (local_wall_now - started_on_device).total_seconds()
+        inferred = now - age
+    else:
+        previous_device_time, local_observation = previous_completion
+        # Differences between device events do not depend on the Windows clock.
+        gap = max(0.0, (started_on_device - previous_device_time).total_seconds())
+        inferred = local_observation + gap
+    return min(now, max(submitted_at, inferred))
+
+
 def estimated_sheets(page_count: int, copies: int, duplex: bool) -> int:
     pages_per_copy = max(0, int(page_count))
     copy_count = max(0, int(copies))
@@ -200,6 +219,7 @@ class PrintEtaObservation:
     complete: bool = True
     timing_samples: tuple[EtaTimingSample, ...] = ()
     projection_key: tuple[object, ...] | None = None
+    status_pending: bool = False
 
     @property
     def anchor_key(self) -> tuple[object, ...]:
@@ -208,11 +228,13 @@ class PrintEtaObservation:
         if self.projection_key is not None:
             return self.projection_key
         return (self.run_id, self.remaining_job_ids, self.rate_samples, self.timing_samples, self.eta,
-                self.held, self.complete)
+                self.held, self.complete, self.status_pending)
 
     def display_text(self, projection: CompletionTimeProjection, now: datetime) -> str:
         if self.held:
             return "인쇄 중지 · 재개 시 재계산"
+        if self.status_pending:
+            return "프린터 상태 확인 중"
         if not self.complete:
             return "예상 완료 시간 일부 계산 불가"
         if not self.remaining_job_ids:

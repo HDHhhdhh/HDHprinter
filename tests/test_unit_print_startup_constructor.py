@@ -79,7 +79,9 @@ class StartupConstructorTests(unittest.TestCase):
         def close_services():
             app.is_closing = True
             app.close_pdf_work_services()
-            app.queue_recovery_writer.close()
+            app.close_queue_recovery()
+            for timer in root.tk.splitlist(root.tk.call("after", "info")):
+                root.tk.call("after", "cancel", timer)
 
         self.addCleanup(close_services)
         root.update_idletasks()
