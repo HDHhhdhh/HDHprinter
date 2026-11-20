@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,10 +20,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.build_quick_printer_release import (  # noqa: E402
+    app_source_commit,
     collect_registered_pdfs,
     load_json,
 )
-from unit_print_paths import RELEASE_ROOT  # noqa: E402
+from unit_print_paths import LOCAL_PATHS_CONFIG, RELEASE_ROOT, RELEASE_ROOT_ENV  # noqa: E402
+from unit_print_instance import SingleInstance  # noqa: E402
 
 
 ASSET_SCHEMA_VERSION = 1
@@ -99,6 +102,39 @@ def parse_args() -> argparse.Namespace:
     pull_parser.add_argument("--state", type=Path)
     pull_parser.add_argument("--dry-run", action="store_true")
 
+    for command, help_text in (
+        ("status", "Report the installed app, catalog and PDF versions."),
+        ("plan-update", "Check a target asset version without applying files."),
+        ("stage-update", "Prepare a verified asset root in a new directory."),
+        ("activate-assets", "Switch the app to a verified asset root while it is closed."),
+    ):
+        inspection = subparsers.add_parser(command, help=help_text)
+        inspection.add_argument("--root", type=Path, default=RELEASE_ROOT)
+        if command in {"plan-update", "stage-update"}:
+            target = inspection.add_mutually_exclusive_group()
+            target.add_argument("--manifest", type=Path, help="Use a downloaded manifest.")
+            target.add_argument("--version", help="Fetch a pinned immutable asset version.")
+            inspection.add_argument("--channel-config", type=Path, default=DEFAULT_CHANNEL_CONFIG)
+        if command == "stage-update":
+            inspection.add_argument("--destination", type=Path, required=True)
+        if command == "activate-assets":
+            inspection.add_argument("--previous", action="store_true", help="Restore the previously selected root.")
+
+    immutable = subparsers.add_parser("publish-version", help="Publish an immutable version of registered PDFs.")
+    immutable.add_argument("--channel-config", type=Path, default=DEFAULT_CHANNEL_CONFIG)
+    immutable.add_argument("--config", type=Path, default=PROJECT_ROOT / "unit_print_manager_config.json")
+    immutable.add_argument("--hash-cache", type=Path, default=DEFAULT_HASH_CACHE)
+    immutable.add_argument("--version")
+    immutable.add_argument("--dry-run", action="store_true")
+    immutable.add_argument("--from-manifest", type=Path, action="append", default=[],
+                           help="Accept exact bytes from an approved previous install or asset inventory.")
+    immutable.add_argument("--retire-list", type=Path,
+                           help="UTF-8 list of reviewed paths absent from the new catalog.")
+    intake = subparsers.add_parser("plan-import", help="Inspect new Ilsan or A:ble PDFs without changing files.")
+    intake.add_argument("--family", choices=("ilsan", "able"), required=True)
+    intake.add_argument("--source-root", type=Path, required=True)
+    intake.add_argument("--root", type=Path, default=RELEASE_ROOT)
+
     return parser.parse_args()
 
 
@@ -113,7 +149,8 @@ def utc_timestamp() -> str:
 def normalize_relative_path(value: str | Path) -> str:
     text = str(value).replace("\\", "/")
     path = PurePosixPath(text)
-    if not text or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    if (not text or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts)
+            or any(char in ':<>|?"*' or ord(char) < 32 for char in text)):
         raise ValueError(f"Unsafe asset path: {value}")
     return path.as_posix()
 
@@ -149,9 +186,30 @@ def json_sha256(payload: dict[str, Any]) -> str:
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     prefix=f".{path.name}.", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            os.replace(temporary, path)
+        finally:
+            stream.close()
+            temporary.unlink(missing_ok=True)
+
+
+def checked_version(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", value):
+        raise ValueError("Invalid asset version.")
+    return value
+
+
+def object_path(entry: AssetEntry) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", entry.sha256):
+        raise ValueError(f"Invalid SHA-256: {entry.relative_path}")
+    return f"objects/{entry.sha256}.pdf"
 
 
 def entry_map(entries: Iterable[AssetEntry]) -> dict[str, AssetEntry]:
@@ -403,6 +461,103 @@ def build_pull_plan(root: Path, entries: Iterable[AssetEntry]) -> PullPlan:
         else:
             downloads.append(entry.relative_path)
     return PullPlan(tuple(downloads), tuple(missing_base), tuple(unchanged_overlay))
+
+
+def installed_inventory(root: Path) -> tuple[dict[str, Any], dict[str, AssetEntry]]:
+    release_path = root / "release_manifest.json"
+    applied_path = root / DEFAULT_LOCAL_MANIFEST
+    catalog_path = PROJECT_ROOT / "unit_print_textbook_catalog.json"
+    release, baseline = load_release_manifest(release_path) if release_path.is_file() else ({}, ())
+    applied = load_asset_manifest(applied_path) if applied_path.is_file() else {}
+    revision = app_source_commit()
+    info = {
+        "root": str(root),
+        "configured_root": str(RELEASE_ROOT),
+        "app_commit": revision or release.get("app_commit"),
+        "baseline_app_commit": release.get("app_commit"),
+        "release_name": release.get("release_name"),
+        "baseline_digest": asset_set_sha256(baseline) if baseline else
+            (applied.get("baseline") or {}).get("asset_set_sha256"),
+        "catalog_schema": load_json(catalog_path).get("schema_version") if catalog_path.is_file() else None,
+        "catalog_sha256": {name: sha256_file(PROJECT_ROOT / name) for name in
+                           ("unit_print_catalog.json", "unit_print_textbook_catalog.json")
+                           if (PROJECT_ROOT / name).is_file()},
+        "asset_version": applied.get("version"),
+        "asset_set_sha256": applied.get("asset_set_sha256") or
+            (asset_set_sha256(baseline) if baseline else None),
+    }
+    known = entry_map(baseline)
+    known.update(entry_map(applied.get("_entries", ())))
+    return info, known
+
+
+def inspect_update(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    info, installed = installed_inventory(root)
+    target = entry_map(manifest["_entries"])
+    downloads, missing_base, conflicts = [], [], []
+    for key, entry in target.items():
+        path = safe_target(root, entry.relative_path)
+        if local_file_matches(path, entry):
+            continue
+        if entry.origin == "base":
+            missing_base.append(entry.relative_path)
+        elif path.exists():
+            prior = installed.get(key)
+            digest = sha256_file(path) if path.is_file() else None
+            accepted = manifest.get("accepted_previous_hashes", {}).get(key, ())
+            if digest is None or (digest not in accepted and (prior is None or digest != prior.sha256)):
+                conflicts.append(entry.relative_path)
+            else:
+                downloads.append(entry.relative_path)
+        else:
+            downloads.append(entry.relative_path)
+    retired = {normalize_relative_path(path).casefold() for path in manifest.get("retired_paths", [])}
+    omitted = [item.relative_path for key, item in installed.items() if key not in target and key not in retired]
+    state = "ready"
+    if (manifest.get("catalog_schema") not in (None, info["catalog_schema"])
+            or manifest.get("catalog_sha256") not in (None, info["catalog_sha256"])):
+        state = "catalog_incompatible"
+    elif conflicts:
+        state = "local_conflict"
+    elif missing_base:
+        state = "baseline_repair_required"
+    elif omitted:
+        state = "inventory_review_required"
+    elif not downloads:
+        state = "current"
+    return {
+        **info,
+        "status": state,
+        "target_version": manifest.get("version"),
+        "target_baseline_digest": (manifest.get("baseline") or {}).get("asset_set_sha256"),
+        "target_asset_set_sha256": manifest.get("asset_set_sha256"),
+        "download_count": len(downloads),
+        "download_bytes": sum(target[path.casefold()].size for path in downloads),
+        "download_paths": downloads,
+        "missing_base_paths": missing_base,
+        "local_conflicts": conflicts,
+        "omitted_paths": omitted,
+        "retired_paths": sorted(item.relative_path for key, item in installed.items() if key in retired),
+    }
+
+
+def command_inspect(args: argparse.Namespace) -> int:
+    root = args.root.resolve()
+    if args.command == "status":
+        report, _ = installed_inventory(root)
+    elif args.manifest is not None:
+        report = inspect_update(root, load_asset_manifest(args.manifest.resolve()))
+    else:
+        channel = load_channel_config(args.channel_config.resolve())
+        executable = find_rclone(str(channel.get("rclone_exe", "")).strip() or None)
+        with tempfile.TemporaryDirectory(prefix="quick-printer-inspect-") as temporary:
+            manifest_path = Path(temporary) / "latest_assets.json"
+            version = getattr(args, "version", None)
+            path = f"versions/{checked_version(version)}.json" if version else "latest_assets.json"
+            copy_remote_file(executable, channel, path, manifest_path)
+            report = inspect_update(root, load_asset_manifest(manifest_path))
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
 
 
 def load_channel_config(path: Path) -> dict[str, Any]:
@@ -804,8 +959,245 @@ def command_pull(args: argparse.Namespace) -> int:
     return 0
 
 
+def transfer_list(executable: Path, channel: dict[str, Any], source: str,
+                  destination: str, work: Path, paths: Iterable[str], *, publish: bool = False) -> None:
+    paths = sorted(set(paths))
+    if not paths:
+        return
+    listing = work / "transfer.txt"
+    listing.write_text("".join(f"{path}\n" for path in paths), encoding="utf-8")
+    options = ["--files-from-raw", str(listing), "--checksum"]
+    run_rclone(executable, channel, [
+        "copy", source, destination, *options, *(["--immutable"] if publish else []),
+    ])
+    if publish:
+        run_rclone(executable, channel, ["check", source, destination, *options, "--one-way"])
+
+
+def command_publish_version(args: argparse.Namespace) -> int:
+    channel = load_channel_config(args.channel_config.resolve())
+    executable = find_rclone(str(channel.get("rclone_exe", "")).strip() or None)
+    version = checked_version(args.version or utc_version())
+    entries, sources = collect_current_assets(args.config.resolve(), args.hash_cache.resolve())
+    if not entries:
+        raise ValueError("No registered PDFs to publish.")
+    previous_hashes: dict[str, set[str]] = {}
+    omitted = set()
+    current = entry_map(entries)
+    for previous_path in getattr(args, "from_manifest", ()):
+        previous = (load_release_manifest(previous_path)[1] if "pdfs" in load_json(previous_path)
+                    else load_asset_manifest(previous_path)["_entries"])
+        for key, record in entry_map(previous).items():
+            if key not in current:
+                omitted.add(key)
+            elif not same_content(record, current[key]):
+                previous_hashes.setdefault(key, set()).add(record.sha256)
+    retire_list = getattr(args, "retire_list", None)
+    retired = ({normalize_relative_path(line).casefold()
+                for line in retire_list.read_text(encoding="utf-8-sig").splitlines() if line.strip()}
+               if retire_list is not None else set())
+    if omitted != retired:
+        raise ValueError(f"Retired paths require explicit review: {sorted(omitted ^ retired)}")
+    objects = {object_path(entry): entry for entry in entries}
+    remote = remote_path(channel)
+    listing = run_rclone(executable, channel, ["lsf", remote, "--recursive", "--files-only"])
+    existing = set(listing.stdout.splitlines())
+    manifest_name = f"versions/{version}.json"
+    if manifest_name in existing:
+        raise FileExistsError(f"Asset version already published: {version}")
+    new_paths = sorted(objects.keys() - existing)
+    print(json.dumps({"version": version, "asset_count": len(entries),
+                      "upload_count": len(new_paths), "upload_bytes": sum(objects[p].size for p in new_paths)}))
+    if args.dry_run:
+        return 0
+    with tempfile.TemporaryDirectory(prefix="quick-printer-immutable-") as temp:
+        work = Path(temp)
+        payload_root = work / "upload"
+        payload_root.mkdir()
+        for path, entry in objects.items():
+            target = safe_target(payload_root, path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sources[entry.relative_path.casefold()], target)
+            if not local_file_matches(target, entry):
+                raise ValueError(f"Publisher input changed during staging: {entry.relative_path}")
+        transfer_list(executable, channel, str(payload_root), remote, work, new_paths, publish=True)
+        # Verify previously published objects too before referencing them.
+        retained = objects.keys() & existing
+        if retained:
+            paths_file = work / "retained.txt"
+            paths_file.write_text("".join(f"{path}\n" for path in sorted(retained)), encoding="utf-8")
+            run_rclone(executable, channel, ["check", str(payload_root), remote, "--files-from-raw",
+                                            str(paths_file), "--checksum", "--one-way"])
+        manifest = manifest_payload(
+            version=version, baseline={}, baseline_entries=(),
+            plan=PublishPlan(tuple(AssetEntry(e.category, e.relative_path, e.size, e.sha256, "overlay")
+                                   for e in entries), (), (), (), ()),
+        )
+        info, _ = installed_inventory(RELEASE_ROOT)
+        manifest.update(storage="sha256", catalog_schema=info["catalog_schema"],
+                        catalog_sha256=info["catalog_sha256"], app_commit=info["app_commit"],
+                        accepted_previous_hashes={key: sorted(hashes) for key, hashes in previous_hashes.items()},
+                        retired_paths=sorted(retired))
+        local_manifest = work / "version.json"
+        write_json_atomic(local_manifest, manifest)
+        run_rclone(executable, channel, ["copyto", str(local_manifest), remote_path(channel, manifest_name),
+                                        "--immutable", "--checksum"])
+        received = work / "received.json"
+        copy_remote_file(executable, channel, manifest_name, received)
+        if sha256_file(local_manifest) != sha256_file(received):
+            raise ValueError("Published manifest failed verification.")
+    return 0
+
+
+def command_plan_import(args: argparse.Namespace) -> int:
+    from pypdf import PdfReader
+    from unit_print_materials import scan_able_catalog
+    from unit_print_server_catalog import build_registered_test_assets
+    from unit_print_test_catalog import scan_test_catalog
+
+    source_root = args.source_root.resolve()
+    paths = {}
+    plans = []
+    if args.family == "ilsan":
+        family_root = Path("data", "일산 기출")
+        catalog = scan_test_catalog(source_root, "일산기출")
+        registered = build_registered_test_assets({}, source_root, {"일산기출": catalog})
+        for asset in registered:
+            paths[asset.path] = {"material_id": asset.material_id, "server_id": asset.server_test_id,
+                                 "subject": asset.subject, "term": asset.term, "level": asset.level}
+    else:
+        family_root = Path("data", "Able", "렉쳐노트")
+        for subject in scan_able_catalog(source_root).subjects:
+            for path in subject.full_documents:
+                paths[path] = {"subject": subject.subject, "type": "full_document"}
+            if subject.review_document is not None:
+                paths[subject.review_document] = {"subject": subject.subject, "type": "review"}
+            for number, path in subject.lesson_documents:
+                paths[path] = {"subject": subject.subject, "type": "lesson", "lesson": number}
+            plans.append({"subject": subject.subject, "lessons": subject.lesson_numbers,
+                          "full_set": [p.relative_to(source_root).as_posix() for p in subject.full_set_documents]})
+
+    files = []
+    for source, metadata in sorted(paths.items(), key=lambda item: item[0].as_posix().casefold()):
+        path = (family_root / source.relative_to(source_root)).as_posix()
+        source = safe_target(source_root, source.relative_to(source_root).as_posix())
+        target = safe_target(args.root, path)
+        with source.open("rb") as stream:
+            pages = len(PdfReader(stream).pages)
+        if pages < 1:
+            raise ValueError(f"PDF has no pages: {path}")
+        digest = sha256_file(source)
+        installed = sha256_file(target) if target.is_file() else None
+        action = "unchanged" if installed == digest else ("replace" if installed else "add")
+        files.append({"path": path, "action": action, "pages": pages, "sha256": digest,
+                      "installed_sha256": installed, **metadata})
+    excluded = [p.relative_to(source_root).as_posix() for p in source_root.rglob("*")
+                if p.is_file() and p.suffix.casefold() == ".pdf" and p not in paths]
+    print(json.dumps({"files": files, "review_unrecognized": sorted(excluded),
+                      "able_print_sets": plans}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_stage_update(args: argparse.Namespace) -> int:
+    root, destination = args.root.resolve(), args.destination.resolve()
+    if destination.exists() or destination.is_relative_to(root):
+        raise ValueError("Choose a new destination outside the installed asset root.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".quick-printer-stage-", dir=destination.parent) as temp:
+        work = Path(temp)
+        channel = None
+        if args.manifest is None:
+            channel = load_channel_config(args.channel_config.resolve())
+            executable = find_rclone(str(channel.get("rclone_exe", "")).strip() or None)
+            version = checked_version(args.version) if args.version else None
+            name = f"versions/{version}.json" if version else "latest_assets.json"
+            manifest_path = work / "target.json"
+            copy_remote_file(executable, channel, name, manifest_path)
+        else:
+            manifest_path = args.manifest.resolve()
+        manifest = load_asset_manifest(manifest_path)
+        report = inspect_update(root, manifest)
+        if report["status"] not in {"ready", "current"}:
+            raise ValueError(f"Cannot stage this asset version: {report['status']}. Run plan-update for details.")
+        entries = manifest["_entries"]
+        if not entries or asset_set_sha256(entries) != manifest.get("asset_set_sha256"):
+            raise ValueError("A verified asset inventory is required.")
+        if any(
+            not (entry.relative_path.startswith("data/") or entry.relative_path == "unit_print_separator_a4.pdf")
+            or not entry.relative_path.casefold().endswith(".pdf")
+            for entry in entries
+        ):
+            raise ValueError("Asset inventories may contain only registered PDFs.")
+        to_download = set(report["download_paths"])
+        if shutil.disk_usage(work).free < sum(entry.size for entry in entries) + report["download_bytes"]:
+            raise OSError("Insufficient space to prepare and verify the asset snapshot.")
+        incoming = work / "incoming"
+        if to_download:
+            if channel is None:
+                channel = load_channel_config(args.channel_config.resolve())
+                executable = find_rclone(str(channel.get("rclone_exe", "")).strip() or None)
+            remote_paths = [object_path(e) if manifest.get("storage") == "sha256"
+                            else f"overlay/{e.relative_path}" for e in entries if e.relative_path in to_download]
+            transfer_list(executable, channel, remote_path(channel), str(incoming), work, remote_paths)
+        snapshot = work / "snapshot"
+        snapshot.mkdir()
+        for entry in entries:
+            source = safe_target(root, entry.relative_path)
+            if entry.relative_path in to_download:
+                relative = object_path(entry) if manifest.get("storage") == "sha256" else f"overlay/{entry.relative_path}"
+                source = safe_target(incoming, relative)
+            target = safe_target(snapshot, entry.relative_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if not local_file_matches(target, entry):
+                raise ValueError(f"Asset copy failed verification: {entry.relative_path}")
+        shutil.copyfile(manifest_path, snapshot / DEFAULT_LOCAL_MANIFEST)
+        snapshot.rename(destination)
+    print(json.dumps({"prepared_root": str(destination), "version": manifest.get("version")}, ensure_ascii=False))
+    return 0
+
+
+def command_activate_assets(args: argparse.Namespace) -> int:
+    if os.environ.get(RELEASE_ROOT_ENV, "").strip():
+        raise ValueError(f"Clear the {RELEASE_ROOT_ENV} override before switching asset roots.")
+    lease = SingleInstance()
+    if not lease.acquire():
+        raise RuntimeError("Close Quick Printer before activating an asset version.")
+    try:
+        settings = load_json(LOCAL_PATHS_CONFIG) if LOCAL_PATHS_CONFIG.is_file() else {}
+        previous_root = settings.get("previous_release_root")
+        if args.previous and not previous_root:
+            raise ValueError("No previous asset root is recorded.")
+        root = Path(previous_root).resolve() if args.previous else args.root.resolve()
+        if args.previous and not (root / DEFAULT_LOCAL_MANIFEST).is_file():
+            if not (root / "data").is_dir():
+                raise ValueError("The previous asset root is unavailable.")
+        else:
+            manifest = load_asset_manifest(root / DEFAULT_LOCAL_MANIFEST)
+            if inspect_update(root, manifest)["status"] != "current":
+                raise ValueError("The staged assets have missing, incompatible, or changed files.")
+        current_root = RELEASE_ROOT.resolve()
+        if root != current_root:
+            settings.update(release_root=str(root), previous_release_root=str(current_root))
+            write_json_atomic(LOCAL_PATHS_CONFIG, settings)
+    finally:
+        lease.close()
+    print(json.dumps({"active_root": str(root)}, ensure_ascii=False))
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.command in {"status", "plan-update"}:
+        return command_inspect(args)
+    if args.command == "publish-version":
+        return command_publish_version(args)
+    if args.command == "plan-import":
+        return command_plan_import(args)
+    if args.command == "stage-update":
+        return command_stage_update(args)
+    if args.command == "activate-assets":
+        return command_activate_assets(args)
     if args.command == "plan":
         return command_plan(args)
     if args.command == "publish":

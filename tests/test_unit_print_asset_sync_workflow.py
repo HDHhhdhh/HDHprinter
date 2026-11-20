@@ -76,7 +76,8 @@ class LocalAssetChannel:
             shutil.copy2(source, destination)
         elif arguments[0] in {"copy", "check"}:
             source_root, destination_root = self.resolve(arguments[1]), self.resolve(arguments[2])
-            file_list = Path(arguments[arguments.index("--files-from") + 1])
+            list_option = "--files-from-raw" if "--files-from-raw" in arguments else "--files-from"
+            file_list = Path(arguments[arguments.index(list_option) + 1])
             for relative_path in file_list.read_text(encoding="utf-8").splitlines():
                 source = sync.safe_target(source_root, relative_path)
                 destination = sync.safe_target(destination_root, relative_path)
@@ -122,6 +123,83 @@ class LocalAssetChannel:
         )
         with self.mocked_remote():
             return sync.command_pull(args)
+
+
+class AssetInspectionTests(unittest.TestCase):
+    def test_pinned_versions_stage_without_overwriting_the_previous_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            channel = LocalAssetChannel(Path(directory))
+            args = argparse.Namespace(
+                channel_config=channel.root / "channel.json", config=channel.root / "app.json",
+                hash_cache=channel.root / "cache.json", dry_run=False, version="first",
+            )
+            channel.target.unlink()
+            with channel.mocked_remote():
+                for version, data in (("first", b"first version"), ("second", b"second version")):
+                    args.version = version
+                    channel.source.write_bytes(data)
+                    with patch.object(sync, "collect_current_assets", return_value=(
+                        (channel.entry(data),), {channel.relative_path: channel.source},
+                    )):
+                        self.assertEqual(0, sync.command_publish_version(args))
+                stage = argparse.Namespace(
+                    root=channel.installed, destination=channel.root / "pinned", manifest=None,
+                    version="first", channel_config=args.channel_config,
+                )
+                channel.corrupt_download = True
+                with self.assertRaisesRegex(ValueError, "failed verification"):
+                    sync.command_stage_update(stage)
+                self.assertFalse(stage.destination.exists())
+                channel.corrupt_download = False
+                self.assertEqual(0, sync.command_stage_update(stage))
+            self.assertEqual(b"first version", (stage.destination / channel.relative_path).read_bytes())
+            self.assertFalse(channel.target.exists())
+
+            config = channel.root / "local_paths.json"
+            with (patch.object(sync, "LOCAL_PATHS_CONFIG", config),
+                  patch.object(sync, "RELEASE_ROOT", channel.installed),
+                  patch.object(sync, "SingleInstance") as lease,
+                  patch.dict("os.environ", {sync.RELEASE_ROOT_ENV: ""}),
+                  contextlib.redirect_stdout(io.StringIO())):
+                args = argparse.Namespace(root=stage.destination, previous=False)
+                lease.return_value.acquire.return_value = False
+                with self.assertRaisesRegex(RuntimeError, "Close Quick Printer"):
+                    sync.command_activate_assets(args)
+                self.assertFalse(config.exists())
+                lease.return_value.acquire.return_value = True
+                self.assertEqual(0, sync.command_activate_assets(args))
+                record = sync.load_json(config)
+                self.assertEqual(stage.destination, Path(record["release_root"]))
+                self.assertEqual(channel.installed, Path(record["previous_release_root"]))
+                with patch.object(sync, "RELEASE_ROOT", stage.destination):
+                    args.previous = True
+                    self.assertEqual(0, sync.command_activate_assets(args))
+                self.assertEqual(channel.installed, Path(sync.load_json(config)["release_root"]))
+
+    def test_baseline_upgrade_reports_conflicts_missing_roots_and_omissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            channel = LocalAssetChannel(Path(directory))
+            root = channel.installed
+            other_path = "data/test/other.pdf"
+            other = sync.AssetEntry("test", other_path, 3, "2" * 64, "base")
+            sync.write_json_atomic(root / "release_manifest.json", {
+                "release_name": "r2", "pdfs": [
+                    {"category": "test", "relative_path": channel.relative_path,
+                     "size": channel.baseline.size, "sha256": channel.baseline.sha256},
+                ],
+            })
+            replacement = channel.entry(b"new", "overlay")
+            report = sync.inspect_update(root, {"_entries": (replacement,), "version": "v1"})
+            self.assertEqual("ready", report["status"])
+            self.assertEqual(3, report["download_bytes"])
+            report = sync.inspect_update(root, {"_entries": (other,), "version": "v1"})
+            self.assertEqual("baseline_repair_required", report["status"])
+            self.assertEqual([other_path], report["missing_base_paths"])
+            self.assertEqual([channel.relative_path], report["omitted_paths"])
+            channel.target.write_bytes(b"custom local")
+            report = sync.inspect_update(root, {"_entries": (replacement,)})
+            self.assertEqual("local_conflict", report["status"])
+            self.assertEqual(b"custom local", channel.target.read_bytes())
 
 
 class QuickPrinterAssetSyncWorkflowTests(unittest.TestCase):

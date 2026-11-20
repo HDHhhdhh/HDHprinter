@@ -72,3 +72,17 @@ def select_configured_root(
 
 RELEASE_ROOT: Final = resolve_release_root()
 DATA_ROOT: Final = RELEASE_ROOT / "data"
+
+
+def select_unit_root(configured: object, *, portable_root: Path, legacy_root: Path) -> Path:
+    """Move a saved default with an activated version, preserving custom roots."""
+    if not os.environ.get(RELEASE_ROOT_ENV, "").strip() and LOCAL_PATHS_CONFIG.is_file():
+        try:
+            settings = json.loads(LOCAL_PATHS_CONFIG.read_text(encoding="utf-8"))
+            previous = _expanded_path(settings.get("previous_release_root"), app_dir=APP_DIR)
+            saved = _expanded_path(configured, app_dir=APP_DIR)
+            if previous is not None and saved is not None and same_path(saved, previous / "data" / "단원평가"):
+                configured = None
+        except (OSError, ValueError, AttributeError):
+            pass
+    return select_configured_root(configured, portable_root=portable_root, legacy_root=legacy_root)

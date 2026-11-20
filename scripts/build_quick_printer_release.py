@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import zipfile
 from dataclasses import asdict, dataclass
@@ -40,7 +41,7 @@ from unit_print_test_catalog import (  # noqa: E402
     TEST_KIND_ORDER,
     scan_test_catalog,
 )
-from unit_print_paths import DATA_ROOT  # noqa: E402
+from unit_print_paths import DATA_ROOT, select_unit_root  # noqa: E402
 from unit_print_textbooks import (  # noqa: E402
     load_textbook_catalog,
     verify_textbook_asset,
@@ -126,6 +127,8 @@ APP_FILES = (
     "scripts/benchmark_quick_printer_preparation.py",
     "scripts/build_quick_printer_release.py",
     "scripts/quick_printer_asset_sync.py",
+    "scripts/quick_printer_eta_report.py",
+    "docs/빠른인쇄기_자료_업데이트.md",
     "scripts/quick_printer_safe_assets.py",
     "scripts/split_quick_printer_release.ps1",
     "scripts/merge_quick_printer_release_parts.ps1",
@@ -174,6 +177,7 @@ PRIVATE_TEMPLATE_FILES = (
     "빠른인쇄기_새PC_설치_인수검사_프롬프트.md",
     "빠른인쇄기_프린터_ComputerUse_설정검증.md",
 )
+DEVICE_LOGIN_INSTRUCTION = "수신 PC에서 사용자가 직접 입력"
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,16 +207,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--destination", type=Path, required=True, help="New release directory; it must not exist.")
     parser.add_argument("--archive", type=Path, required=True, help="Output Zip64 archive path; it must not exist.")
     parser.add_argument(
-        "--department-id",
-        default="수신 PC에서 사용자가 직접 입력",
-        help="Instruction shown in the guide; omit to keep credentials out of the release.",
-    )
-    parser.add_argument(
-        "--department-pin",
-        default="수신 PC에서 사용자가 직접 입력",
-        help="Instruction shown in the guide; omit to keep credentials out of the release.",
-    )
-    parser.add_argument(
         "--reference-gui",
         type=Path,
         help="Optional visual-QA directory copied verbatim into reference_gui/.",
@@ -234,6 +228,23 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON object expected: {path}")
     return payload
+
+
+def app_source_commit() -> str | None:
+    if not (PROJECT_ROOT / ".git").exists():
+        return None
+    try:
+        unchanged = subprocess.run(
+            ["git", "diff", "HEAD", "--quiet", "--"], cwd=PROJECT_ROOT, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if unchanged.returncode == 0:
+            return subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return None
 
 
 def extract_drive_folder_id(value: str) -> str:
@@ -259,11 +270,10 @@ def extract_drive_folder_id(value: str) -> str:
 def collect_unit_sources(config: dict[str, Any]) -> list[PdfSource]:
     catalog = load_json(PROJECT_ROOT / "unit_print_catalog.json")
     portable_root = DATA_ROOT / "단원평가"
-    root = Path(
-        str(
-            config.get("root_dir")
-            or (portable_root if portable_root.is_dir() else r"D:\테스트\단원평가")
-        )
+    root = select_unit_root(
+        config.get("root_dir"),
+        portable_root=portable_root,
+        legacy_root=Path(r"D:\테스트\단원평가"),
     )
     sources: list[PdfSource] = []
     for subject in catalog.get("subjects", []):
@@ -906,7 +916,7 @@ def main() -> int:
     records = collect_registered_pdfs(config)
     destination.mkdir(parents=True)
     copy_app_files(destination, args.reference_gui)
-    render_private_release_templates(destination, args.department_id, args.department_pin)
+    render_private_release_templates(destination, DEVICE_LOGIN_INSTRUCTION, DEVICE_LOGIN_INSTRUCTION)
     write_portable_config(destination)
     asset_drive_folder_url = args.asset_drive_folder_url or args.drive_folder_url
     write_portable_asset_channel(destination, asset_drive_folder_url)
@@ -924,7 +934,7 @@ def main() -> int:
 
     apex_records = [record for record in records if record.category == "APEX"]
     portable_cache_entries = write_portable_apex_cache(destination, apex_records)
-    write_release_docs(destination, counts, total_bytes, args.department_id, args.department_pin)
+    write_release_docs(destination, counts, total_bytes, DEVICE_LOGIN_INSTRUCTION, DEVICE_LOGIN_INSTRUCTION)
 
     (destination / "registered_pdfs.sha256").write_text(
         "".join(f"{entry.sha256} *{entry.relative_path}\n" for entry in manifest_entries),
@@ -937,6 +947,7 @@ def main() -> int:
     manifest = {
         "schema_version": 2,
         "release_name": destination.name,
+        "app_commit": app_source_commit(),
         "generated_at": generated_at,
         "registered_pdf_count": len(manifest_entries),
         "registered_pdf_bytes": total_bytes,
@@ -969,8 +980,8 @@ def main() -> int:
         registered_pdf_bytes=total_bytes,
         immutable_file_count=len(immutable_entries),
         drive_folder_url=args.drive_folder_url,
-        department_id=args.department_id,
-        department_pin=args.department_pin,
+        department_id=DEVICE_LOGIN_INSTRUCTION,
+        department_pin=DEVICE_LOGIN_INSTRUCTION,
         asset_drive_folder_url=asset_drive_folder_url,
     )
     result = {
