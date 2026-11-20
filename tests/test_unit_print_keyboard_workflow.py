@@ -456,6 +456,30 @@ class KeyboardWorkflowTests(unittest.TestCase):
         self.assertEqual(0, app.queue_selection_anchor)
         self.assertEqual([], app.undo_stack)
 
+    def test_body_drag_selects_range_without_reordering_and_can_shrink(self):
+        app = self.app(4)
+        before = tuple(app.blocks)
+        click = event(app.queue_canvas, x=100, y=110)
+        app.on_queue_drag_start(click)
+        app.on_queue_drag_motion(event(app.queue_canvas, x=100, y=10))
+        self.assertEqual({0, 1, 2}, app.selected_block_indices)
+        app.on_queue_drag_motion(click)
+        app.on_queue_drag_release(click)
+        self.assertEqual({2}, app.selected_block_indices)
+        self.assertEqual(before, tuple(app.blocks))
+        self.assertEqual([], app.undo_stack)
+
+    def test_partial_print_uses_only_selected_waiting_blocks_in_queue_order(self):
+        app = self.app(4)
+        app.selected_block_indices = {3, 1}
+        app.begin_print_preparation = Mock()
+        app.print_selected_queue_blocks()
+        app.begin_print_preparation.assert_called_once_with("selected", [app.blocks[1], app.blocks[3]])
+        app.begin_print_preparation.reset_mock()
+        app.block_status_by_id[id(app.blocks[3])] = "완료 미확인"
+        app.print_selected_queue_blocks()
+        app.begin_print_preparation.assert_not_called()
+
     def test_print_start_between_drag_press_and_release_cannot_reorder(self):
         app = self.app(4)
         before = tuple(app.blocks)

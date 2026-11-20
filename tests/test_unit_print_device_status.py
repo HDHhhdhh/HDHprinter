@@ -11,7 +11,7 @@ from unit_print_canon_status import CanonStatusClient, parse_health_html, parse_
 from unit_print_device_credentials import credential_target
 from unit_print_device_scheduler import prepare_dispatch_copy
 from unit_print_device_monitor import PrinterDeviceMonitor
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from unit_print_device_state import DeviceHealth, DeviceJob, DeviceJobState, DeviceSnapshot
 from unit_print_device_ui import build_device_status_view
@@ -615,11 +615,11 @@ class DeviceDispatchTests(unittest.TestCase):
             snapshot = replace(stale, consecutive_stale_reads=count)
             self.assertEqual(count == STALE_READ_HOLD_THRESHOLD, hold.observe(snapshot))
         self.assertEqual("stale", hold.kind)
-        self.assertFalse(hold.can_resume(stale, operator_resume=True))
-        healthy = DeviceSnapshot(observed_at=datetime.now().astimezone(),
+        self.assertFalse(hold.can_resume(stale))
+        healthy = DeviceSnapshot(observed_at=stale.observed_at + timedelta(seconds=1),
                                  health=DeviceHealth.READY, authenticated=True)
         hold.observe(healthy)
-        self.assertTrue(hold.can_resume(healthy, operator_resume=False))
+        self.assertTrue(hold.can_resume(healthy))
         hold.resume()
         self.assertEqual("", hold.kind)
 
@@ -637,7 +637,7 @@ class DeviceDispatchTests(unittest.TestCase):
         self.assertFalse(hold.observe(replace(stale, consecutive_stale_reads=1)))
         self.assertEqual("", hold.kind)
 
-    def test_fault_is_immediate_and_stays_manual_through_stale_recovery(self) -> None:
+    def test_fault_requires_new_healthy_snapshot_and_no_held_job(self) -> None:
         hold = DeviceDispatchHold()
         fault = DeviceSnapshot(observed_at=datetime.now().astimezone(),
                                health=DeviceHealth.ERROR, errors=("paper",), authenticated=True)
@@ -646,12 +646,12 @@ class DeviceDispatchTests(unittest.TestCase):
         hold.observe(replace(DeviceSnapshot.unavailable("timeout"), consecutive_stale_reads=3))
         self.assertEqual("fault", hold.kind)
         healthy = replace(fault, health=DeviceHealth.READY, errors=())
-        hold.observe(healthy)
-        self.assertFalse(hold.can_resume(healthy, operator_resume=False))
-        self.assertTrue(hold.can_resume(healthy, operator_resume=True))
-        self.assertFalse(hold.can_resume(healthy, operator_resume=True, job_held=True))
+        self.assertFalse(hold.can_resume(healthy))
+        recovered = replace(healthy, observed_at=fault.observed_at + timedelta(seconds=1))
+        self.assertTrue(hold.can_resume(recovered))
+        self.assertFalse(hold.can_resume(recovered, job_held=True))
 
-    def test_stale_hold_escalates_to_manual_hold_on_real_device_fault(self) -> None:
+    def test_stale_hold_escalates_to_fault_and_requires_new_snapshot(self) -> None:
         hold = DeviceDispatchHold()
         hold.observe(replace(DeviceSnapshot.unavailable("timeout"), consecutive_stale_reads=3))
         fault = DeviceSnapshot(observed_at=datetime.now().astimezone(),
@@ -659,7 +659,7 @@ class DeviceDispatchTests(unittest.TestCase):
         self.assertTrue(hold.observe(fault))
         self.assertEqual("fault", hold.kind)
         healthy = replace(fault, health=DeviceHealth.READY)
-        self.assertFalse(hold.can_resume(healthy, operator_resume=False))
+        self.assertFalse(hold.can_resume(healthy))
 
     def test_stale_snapshot_with_held_job_is_a_fault_not_connectivity_only(self) -> None:
         hold = DeviceDispatchHold()

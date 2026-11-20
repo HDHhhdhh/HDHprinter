@@ -1258,11 +1258,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.recovery_poll_after_id: str | None = None
         self.print_state_lock = threading.Lock()
         self.print_cancel_event = threading.Event()
-        self.device_resume_event = threading.Event()
-        self.device_resume_event.set()
         self.device_hold_active = False
         self.device_hold_message = ""
-        self.device_hold_connectivity_only = False
         self.device_monitor: PrinterDeviceMonitor | None = None
         configured_device_monitor = self.config.get("device_monitor", {})
         self.device_monitor_config: dict[str, object] = (
@@ -3540,7 +3537,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         queue_head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         queue_head.columnconfigure(0, weight=1)
         ttk.Label(queue_head, text="작업 큐", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(queue_head, text="순서를 드래그하거나 선택한 블록을 수정하세요.", style="SectionHint.TLabel").grid(
+        ttk.Label(queue_head, text="본문 드래그: 범위 선택 · 왼쪽 ⋮⋮: 순서 이동 · 우클릭: 선택 인쇄", style="SectionHint.TLabel").grid(
             row=1, column=0, sticky="w", pady=(3, 0)
         )
         queue_button_row = ttk.Frame(queue_head, style="Surface.TFrame")
@@ -3720,7 +3717,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ).pack(side="left", padx=(0, 7))
         self.device_resume_button = ttk.Button(
             footer_actions,
-            text="해결 후 이어서",
+            text="상태 다시 확인",
             style="SoftAction.TButton",
             command=self.resume_device_print,
             state="disabled",
@@ -9900,7 +9897,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             actions.pack(fill="x")
             self.persistent_alert_resume_button = ttk.Button(
                 actions,
-                text="해결 후 이어서",
+                text="상태 다시 확인",
                 style="Primary.TButton",
                 command=self.resume_device_print,
             )
@@ -10400,9 +10397,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 or getattr(self, "device_fault_notification_active", False)
             ):
                 action = (
-                    "앱에서 [해결 후 이어서]를 눌러 남은 작업을 계속해 주세요."
-                    if self.device_hold_active and not getattr(self, "device_hold_connectivity_only", False)
-                    else "앱이 남은 인쇄 상태 확인을 계속합니다."
+                    "전송된 작업을 확인한 뒤 자동으로 이어서 인쇄합니다."
+                    if self.device_hold_active else "프린터 상태가 정상으로 돌아왔습니다."
                 )
                 self.notify_operator(
                     "printer-recovery",
@@ -10587,8 +10583,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         def update() -> None:
             self.device_hold_active = True
             self.device_hold_message = message
-            self.device_hold_connectivity_only = snapshot.connectivity_only
-            action = "연결 복구 시 자동 재개" if snapshot.connectivity_only else "해결 후 이어서 눌러 주세요"
+            action = "프린터 정상 상태 확인 후 자동 재개"
             self.set_status("프린터 연결 대기 / 인쇄 일시 중지" if snapshot.connectivity_only else "프린터 오류 / 인쇄 일시 중지")
             self.set_current_work(f"현재 작업: {message} · {action}")
             self.refresh_print_action_buttons()
@@ -10597,36 +10592,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.root.after(0, update)
 
     def resume_device_print(self) -> None:
+        """Request a fresh observation. Only the print worker can release a hold."""
         monitor = self.device_monitor
-        if monitor is None:
-            messagebox.showwarning(APP_TITLE, "먼저 프린터 상태 연결을 설정해 주세요.")
-            return
-        snapshot = monitor.latest_snapshot
-        active_hold = any(job.state == DeviceJobState.HELD for job in snapshot.active_jobs)
-        if snapshot.stale or snapshot.health in {
-            DeviceHealth.ERROR,
-            DeviceHealth.HELD,
-            DeviceHealth.OFFLINE,
-        } or active_hold:
-            messagebox.showwarning(
-                APP_TITLE,
-                f"프린터 오류가 아직 해제되지 않았습니다.\n\n{snapshot.status_text}",
-            )
+        if monitor is not None:
             monitor.refresh_now()
-            return
-        self.device_hold_active = False
-        self.device_hold_message = ""
-        self.device_hold_connectivity_only = False
-        self.device_fault_notification_active = False
-        gate = getattr(self, "notification_gate", None)
-        if gate is not None:
-            gate.clear("printer-recovery")
-        self.device_resume_event.set()
-        monitor.refresh_now()
-        self.set_taskbar_display_state("running")
-        self.set_status("실제 인쇄 확인 중")
-        self.set_current_work("현재 작업: 멈춘 작업의 실제 완료를 기다리는 중")
-        self.refresh_print_action_buttons()
 
     def refresh_print_action_buttons(self) -> None:
         preparing = getattr(self, "_print_preparation_request", None) is not None
@@ -10876,7 +10845,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             return self.colors["complete_soft"], self.colors["complete"], self.colors["complete"]
         if status in {"대기", "추가됨", "예약"}:
             return self.colors["warning_soft"], self.colors["warning"], self.colors["warning"]
-        if status in {"오류", "경고", "중지됨"}:
+        if status in {"오류", "경고", "중지됨", "완료 미확인"}:
             return self.colors["danger_soft"], self.colors["danger"], self.colors["danger"]
         return self.colors["panel_soft"], self.colors["muted"], self.colors["border_soft"]
 
@@ -13779,6 +13748,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         menu.add_separator()
         has_selection = bool(self.selected_block_indices)
         menu.add_command(
+            label="선택 블록 인쇄",
+            command=self.print_selected_queue_blocks,
+            state="normal" if self.selected_blocks_for_partial_print() else "disabled",
+        )
+        menu.add_command(
             label="원본 경로 열기",
             command=self.open_selected_block_source_folders,
             state="normal" if has_selection and not getattr(self, "source_paths_open_pending", False) else "disabled",
@@ -14094,8 +14068,28 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             card_height=self.queue_card_height, card_gap=self.queue_card_gap,
         )
 
+    def selected_blocks_for_partial_print(self) -> list[PrintBlock]:
+        if (self.is_printing or getattr(self, "retry_batch", None) is not None
+                or getattr(self, "_print_preparation_request", None) is not None
+                or getattr(self, "group_build_pending", False)):
+            return []
+        selected = self.selected_block_indices
+        blocks = [block for index, block in enumerate(self.blocks) if index in selected]
+        waiting_ids = {id(block) for block in self.blocks_waiting_for_print()}
+        return blocks if all(id(block) in waiting_ids for block in blocks) else []
+
+    def print_selected_queue_blocks(self) -> None:
+        if not self.save_pending_queue_editor():
+            return
+        blocks = self.selected_blocks_for_partial_print()
+        if not blocks:
+            self.queue_status_var.set("인쇄가 대기 중인 블록만 선택해 주세요. 진행 중인 인쇄나 재시도가 없어야 합니다.")
+            return
+        self.begin_print_preparation("selected", blocks)
+
     def on_queue_drag_start(self, event: tk.Event) -> str:
         self.cancel_drop_animation()
+        self.queue_range_drag = None
         canvas_y = self.queue_canvas.canvasy(event.y)
         index = self.queue_hit_index_from_y(canvas_y)
         if index is None:
@@ -14122,6 +14116,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.drag_active = False
             if selected:
                 self.focus_queue_canvas()
+            return "break"
+        if getattr(event, "x", 0) >= self.queue_padding + 40:
+            self.drag_start_index = None
+            if self.select_queue_with_modifiers(index, 0):
+                self.focus_queue_canvas()
+                self.queue_range_drag = (index, canvas_y)
             return "break"
         selected = set(self.selected_block_indices)
         drag_indices = tuple(sorted(selected)) if index in selected else (index,)
@@ -14155,7 +14155,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         return "break"
 
     def on_queue_drag_motion(self, event: tk.Event) -> str:
-        if self.drag_start_index is None:
+        range_drag = getattr(self, "queue_range_drag", None)
+        if self.drag_start_index is None and range_drag is None:
             return "break"
         if event.y < 28:
             self.queue_canvas.yview_scroll(-1, "units")
@@ -14163,6 +14164,17 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.queue_canvas.yview_scroll(1, "units")
 
         canvas_y = self.queue_canvas.canvasy(event.y)
+        if range_drag is not None:
+            anchor, origin_y = range_drag
+            if (anchor < len(self.blocks)
+                    and (abs(canvas_y - origin_y) >= 8 or self.selected_block_indices != {anchor})):
+                end = min(len(self.blocks) - 1, max(0, int(
+                    (canvas_y - self.queue_padding) // (self.queue_card_height + self.queue_card_gap)
+                )))
+                indices = set(range(min(anchor, end), max(anchor, end) + 1))
+                if indices != self.selected_block_indices:
+                    self.select_queue_indices(indices, focus_index=anchor, anchor_index=anchor)
+            return "break"
         self.drag_pointer_y = canvas_y
         if not self.drag_active and abs(canvas_y - self.drag_origin_y) < 8:
             return "break"
@@ -14198,6 +14210,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         return "break"
 
     def on_queue_drag_release(self, event: tk.Event) -> str:
+        if getattr(self, "queue_range_drag", None) is not None:
+            self.queue_range_drag = None
+            return "break"
         if self.drag_start_index is None:
             return "break"
         start_index = self.drag_start_index

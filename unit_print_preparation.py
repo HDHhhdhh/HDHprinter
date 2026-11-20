@@ -279,7 +279,11 @@ class PrintPreparationService:
 
         # Put the current job first so look-ahead work can never delay it.
         for job in tuple(jobs)[:1 + max(0, limit)]:
-            key = self.key_for(job)
+            try:
+                key = self.key_for(job)
+            except OSError:
+                # Resolve this source at its dispatch position, not during look-ahead.
+                continue
             if key is not None:
                 self._submit(key)
 

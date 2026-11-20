@@ -468,9 +468,9 @@ class QueueBundleTest(unittest.TestCase):
             commands = menu_class.return_value.add_command.call_args_list
             self.assertEqual(["묶기", "이름 채우기"], [call.kwargs["label"] for call in commands[:2]])
             self.assertEqual(["normal", "normal"], [call.kwargs["state"] for call in commands[:2]])
-            self.assertEqual(["원본 경로 열기", "복사", "붙여넣기", "복제", "삭제", "가나다 정렬"],
+            self.assertEqual(["선택 블록 인쇄", "원본 경로 열기", "복사", "붙여넣기", "복제", "삭제", "가나다 정렬"],
                              [call.kwargs["label"] for call in commands[2:]])
-            source_command = commands[2].kwargs
+            source_command = commands[3].kwargs
             self.assertEqual("normal", source_command["state"])
             self.assertIs(app.open_selected_block_source_folders, source_command["command"])
             source_command["command"]()

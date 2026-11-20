@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,6 +77,10 @@ class QueueLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.dialog = patch("unit_print_manager.messagebox.askyesno", return_value=True).start()
         self.addCleanup(patch.stopall)
+        # Real separator generation must not leave synthetic PDFs in an
+        # installed release, where the full inventory rejects extra PDFs.
+        name_cache = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch("unit_print_manager.NAME_SEPARATOR_CACHE_DIR", name_cache))
         for name in ("showinfo", "showwarning", "showerror"):
             patch("unit_print_manager.messagebox." + name).start()
         # Tripwires: these tests can never reach a real printer or config write.

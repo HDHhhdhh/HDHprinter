@@ -17,6 +17,11 @@ class DeviceDispatchHold:
         self.kind = ""
         self._stale_reads = 0
         self._last_observed_at = None
+        self._hold_observed_at = None
+
+    def hold_for_fault(self, snapshot: DeviceSnapshot) -> None:
+        self.kind = "fault"
+        self._hold_observed_at = snapshot.observed_at
 
     def observe(self, snapshot: DeviceSnapshot, *, job_held: bool = False) -> bool:
         """Return True only when entering a hold or escalating stale to fault."""
@@ -29,24 +34,26 @@ class DeviceDispatchHold:
                 self._stale_reads += 1
             if self._stale_reads >= STALE_READ_HOLD_THRESHOLD and not self.kind:
                 self.kind = "stale"
+                self._hold_observed_at = snapshot.observed_at
         else:
             self._stale_reads = 0
             if not snapshot.can_dispatch or job_held:
-                self.kind = "fault"
+                self.hold_for_fault(snapshot)
         self._last_observed_at = snapshot.observed_at
         return self.kind != previous
 
-    def can_resume(self, snapshot: DeviceSnapshot, *, operator_resume: bool, job_held: bool = False) -> bool:
+    def can_resume(self, snapshot: DeviceSnapshot, *, job_held: bool = False) -> bool:
         return (
-            bool(self.kind)
+            self._hold_observed_at is not None
+            and snapshot.observed_at > self._hold_observed_at
             and snapshot.can_dispatch
             and not job_held
-            and (self.kind == "stale" or operator_resume)
         )
 
     def resume(self) -> None:
         self.kind = ""
         self._stale_reads = 0
+        self._hold_observed_at = None
 
 
 @dataclass(frozen=True)

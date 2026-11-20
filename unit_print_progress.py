@@ -99,7 +99,7 @@ def persistent_alert_for_status(
             title="프린터 인쇄 중지",
             message=(
                 f"{detail}\n"
-                "원인을 해결한 뒤 이어서 진행하세요. 해결 전에는 다음 문서를 전송하지 않습니다."
+                "원인을 해결하면 상태를 확인한 뒤 자동으로 인쇄를 이어갑니다."
             ),
             tone="warning",
             allow_resume=True,

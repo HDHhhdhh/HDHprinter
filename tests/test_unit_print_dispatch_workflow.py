@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import re
 import tempfile
-import threading
 import unittest
 from concurrent.futures import Future
 from datetime import datetime, timedelta
@@ -29,8 +28,7 @@ class ImmediateRoot:
 class ScriptedMonitor:
     """Exercise the real rolling worker without network, sleep, or printing."""
 
-    def __init__(self, app, *, acceptance_timeout=False, fresh_timeout=False, hold=False):
-        self.app = app
+    def __init__(self, *, acceptance_timeout=False, fresh_timeout=False, hold=False):
         self.client = SimpleNamespace(base_url="http://192.168.0.248:8000")
         self.acceptance_timeout = acceptance_timeout
         self.fresh_timeout = fresh_timeout
@@ -110,8 +108,8 @@ class ScriptedMonitor:
                 health = DeviceHealth.ERROR
                 errors = ("스테이플을 보급해 주세요",)
                 state = DeviceJobState.HELD
-            else:
-                self.app.device_resume_event.set()
+            elif step == "still-held":
+                state = DeviceJobState.HELD
         else:
             count = len(self.pending_tokens) if self.completion_batch_size is None else self.completion_batch_size
             self.completed_tokens.extend(self.pending_tokens[:count])
@@ -146,7 +144,6 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.app.is_closing = False
         self.app.print_history = PrintHistory(self.directory / "history")
         self.app.history_run_id = None
-        self.app.device_resume_event = threading.Event()
         self.app.device_hold_active = False
         self.app.device_hold_message = ""
         self.app.device_monitor_config = {}
@@ -164,7 +161,7 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.jobs = tuple(self.app.initialize_active_print_queue(self.blocks, False))
         self.app.print_run_options = self.options
         self.app.is_printing = True
-        self.monitor = ScriptedMonitor(self.app)
+        self.monitor = ScriptedMonitor()
         self.app.device_monitor = self.monitor
         self.enqueue = patch("unit_print_manager.sumatra_enqueue_pdfs", side_effect=self.monitor.send).start()
         self.addCleanup(patch.stopall)
@@ -504,6 +501,25 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertEqual([self.jobs[0].job_id], records[-1]["uncertain_job_ids"])
         self.assertEqual("dispatch_uncertain", records[-1]["phase"])
 
+    def test_missing_pdf_drains_submitted_jobs_before_retaining_unsent_retry(self):
+        def route(job, _printer):
+            # The initial run manifest sees all files. The next job's source
+            # disappears after the first job has crossed the dispatch boundary.
+            if job.job_id == self.jobs[1].job_id and self.monitor.sent_tokens:
+                raise ValueError("moved PDF")
+            return "FAKE 세로"
+
+        self.app.route_job_printer.side_effect = route
+        records = self.run_worker()
+        self.enqueue.assert_called_once()
+        completed = [row["job_id"] for row in records if row["event"] == "job_physically_completed"]
+        self.assertEqual([self.jobs[0].job_id], completed)
+        self.assertEqual("완료", self.app.queue_block_status(self.blocks[0]))
+        self.assertEqual("오류", self.app.queue_block_status(self.blocks[1]))
+        self.assertEqual("run_failed", records[-1]["event"])
+        self.assertEqual([], records[-1]["outstanding_tokens"])
+        self.assertEqual(self.jobs[1:], self.app.retry_batch.jobs)
+
     def test_required_history_failure_before_attempt_keeps_every_job_retryable(self):
         real_record = self.app.print_history.record
 
@@ -531,17 +547,21 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertEqual([job.job_id for job in self.jobs[1:]], [job.job_id for job in self.app.retry_batch.jobs])
         self.assertEqual("submission_history", records[-1]["phase"])
 
-    def test_hold_requires_recovery_before_refilling_and_does_not_resend(self):
-        self.monitor.hold_steps = ["held", "resumed"]
+    def test_fault_recovers_without_click_only_after_held_job_clears(self):
+        self.monitor.hold_steps = ["held", "still-held", "resumed"]
         records = self.run_worker()
         self.assertEqual(1, self.app.enter_device_hold.call_count)
         events = [event[0] for event in self.monitor.events]
         self.assertEqual(["send", "acknowledge"] * 2, events[:4])
-        self.assertEqual(["held", "resumed"], events[4:6])
-        self.assertEqual(["send", "acknowledge"] * 2, events[6:])
+        self.assertEqual(["held", "still-held", "resumed"], events[4:7])
+        self.assertEqual(["send", "acknowledge"] * 2, events[7:])
         self.assertEqual(4, len(set(self.monitor.sent_tokens)))
         names = [record["event"] for record in records]
         self.assertLess(names.index("device_dispatch_held"), names.index("device_dispatch_resumed"))
+        self.assertEqual(
+            ["실제 인쇄 확인 중", "실제 인쇄 확인 중", "실제 인쇄 완료"],
+            [call.args[0] for call in self.app.set_status.call_args_list],
+        )
         self.assertTrue(records[-1]["physical_output_verified"])
 
     def test_single_stale_read_pauses_new_submissions_without_operator_hold(self):
@@ -566,7 +586,7 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertEqual(4, len(set(self.monitor.sent_tokens)))
         self.assertTrue(records[-1]["physical_output_verified"])
 
-    def test_stale_hold_followed_by_device_fault_keeps_explicit_resume(self):
+    def test_stale_hold_followed_by_device_fault_still_recovers_automatically(self):
         self.monitor.stale_steps = ["stale", "stale", "stale", "recovered"]
         self.monitor.hold_steps = ["held", "resumed"]
         records = self.run_worker()
@@ -642,7 +662,6 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertEqual(set(), self.app.print_started_block_ids)
         self.assertIsNone(self.app.print_run_options)
         self.assertIsNone(self.app.active_print_block_uid)
-        self.assertTrue(self.app.device_resume_event.is_set())
         self.assertEqual(0, self.monitor.pause_count)
 
     def assert_no_submission_failure_retains_original_jobs(self, records):
@@ -655,7 +674,6 @@ class RollingDispatchWorkflowTests(unittest.TestCase):
         self.assertEqual(set(), self.app.print_started_block_ids)
         self.assertIsNone(self.app.print_run_options)
         self.assertIsNone(self.app.active_print_block_uid)
-        self.assertTrue(self.app.device_resume_event.is_set())
         self.assertEqual(0, self.monitor.pause_count)
         self.assertEqual("run_failed", records[-1]["event"])
         self.assertEqual(0, records[-1]["submitted_jobs"])

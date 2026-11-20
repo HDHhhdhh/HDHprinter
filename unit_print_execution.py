@@ -473,7 +473,7 @@ class PrintExecutionMixin:
                 if mode != "retry" and any(block_requires_omr_sheet(block) for block in blocks)
                 else None
             )
-            if mode != "append" and not options.dry_run:
+            if mode not in {"append", "selected"} and not options.dry_run:
                 self.schedule_resource_estimate()
             monitor = getattr(self, "device_monitor", None)
             monitor_url = str(monitor.client.base_url).strip().rstrip("/") if monitor is not None else ""
@@ -598,7 +598,7 @@ class PrintExecutionMixin:
         estimate = None
         estimate_error = None
         future = request.resource_future
-        if request.mode != "append" and not options.dry_run and future is not None:
+        if request.mode not in {"append", "selected"} and not options.dry_run and future is not None:
             try:
                 estimate = future.result(timeout=15.0)
             except Exception as error:
@@ -774,6 +774,9 @@ class PrintExecutionMixin:
             return (f"새 블록 {len(blocks)}개, PDF {total_files}개, 총 {total_sets}세트를 "
                     f"현재 인쇄 큐 뒤에 이어서 추가할까요?{names}{omr}")
         separators = f"\n구분지 {len(blocks)}장을 블록 뒤에 추가합니다." if request.include_separator_pages else ""
+        if request.mode == "selected":
+            return (f"선택한 블록 {len(blocks)}개, PDF {total_files}개, 총 {total_sets}세트를 "
+                    f"작업 큐 순서대로 인쇄할까요?{names}{omr}{separators}")
         return (f"블록 {len(blocks)}개, PDF {total_files}개, 총 {total_sets}세트를 순서대로 인쇄할까요?"
                 f"{names}{omr}{separators}{self.resource_estimate_confirmation_text()}")
 
@@ -843,6 +846,8 @@ class PrintExecutionMixin:
         self.begin_taskbar_print_run(len(jobs))
         with self.print_state_lock:
             self.print_run_options = options
+            if request.mode == "selected":
+                self.print_accepting_appends = False
         self.print_cancel_event.clear()
         self.is_printing = True
         self._end_print_preparation(request, restore=False)
@@ -947,9 +952,6 @@ class PrintExecutionMixin:
             self.print_run_options = None
         self.device_hold_active = False
         self.device_hold_message = ""
-        resume_event = getattr(self, "device_resume_event", None)
-        if resume_event is not None:
-            resume_event.set()
         self.is_printing = False
         self.print_thread = None
         self.history_run_id = None
@@ -990,8 +992,11 @@ class PrintExecutionMixin:
         phase = "rolling_preparation"
         paused_for_device = False
         device_hold = DeviceDispatchHold()
+        device_resumed_at = 0.0
+        recovery_check_started: float | None = None
         full_snapshot_pause_active = False
         active_block_uid: int | None = None
+        preparation_error: Exception | None = None
 
         def sheet_count(job: PrintJob) -> int:
             cached = sheet_estimates.get(job.job_id)
@@ -1071,9 +1076,11 @@ class PrintExecutionMixin:
                 f"프린터 내부 {window.outstanding_count}건 · 미전송 {unsent}건 · "
                 f"{completion_text}"
             )
-            if paused_for_device:
+            if preparation_error is not None:
+                self.set_current_work(f"현재 작업: 새 전송 중단 · 전송된 작업 완료 확인 중 · {status}")
+            elif paused_for_device:
                 reason = self.device_hold_message or "프린터 오류가 아직 해제되지 않았습니다"
-                action = "연결 복구 시 자동 재개" if device_hold.kind == "stale" else "해결 후 이어서 눌러 주세요"
+                action = "프린터 정상 상태 확인 후 자동 재개"
                 self.set_current_work(
                     f"현재 작업: {reason} · {action} · {status}"
                 )
@@ -1084,7 +1091,7 @@ class PrintExecutionMixin:
                 total_jobs,
                 run_id=display_run_id,
             )
-            if active_block_uid is not None:
+            if active_block_uid is not None and preparation_error is None:
                 self.mark_block_status(active_block_uid, "진행 중", status)
 
         def mark_completed_blocks() -> None:
@@ -1106,7 +1113,6 @@ class PrintExecutionMixin:
                 four_up=services.materialize_four_up_pdf,
                 scheduler=getattr(self, "pdf_work_scheduler", None),
             )
-            self.device_resume_event.set()
             total_jobs = self.active_print_total_jobs()
             planned_jobs, _ = self.active_print_batch(0, total_jobs)
             self.assert_device_binding_for_dispatch(run_options, monitor)
@@ -1150,7 +1156,8 @@ class PrintExecutionMixin:
                 timing_contaminated = timing_contaminated or foreign_active or not snapshot.can_dispatch
                 total_jobs = self.active_print_total_jobs()
                 lookahead, _ = self.active_print_batch(job_index, 3)
-                preparation.prefetch_jobs(lookahead, limit=2)
+                if preparation_error is None:
+                    preparation.prefetch_jobs(lookahead, limit=2)
 
                 phase = "device_reconciliation"
                 reconciled = window.reconcile(snapshot)
@@ -1202,6 +1209,12 @@ class PrintExecutionMixin:
                     if snapshot.can_dispatch and not paused_for_device and not foreign_active:
                         timing_contaminated = False
 
+                if preparation_error is not None and (
+                    not window.outstanding_count or reconciled.failed or reconciled.held
+                    or not snapshot.can_dispatch
+                ):
+                    raise preparation_error
+
                 if reconciled.failed:
                     failed_entry = reconciled.failed[0]
                     failed_meta = outstanding.get(failed_entry.token)
@@ -1213,7 +1226,6 @@ class PrintExecutionMixin:
                 if device_hold.observe(snapshot, job_held=bool(reconciled.held)):
                     timing_contaminated = True
                     paused_for_device = True
-                    self.device_resume_event.clear()
                     self.enter_device_hold(snapshot)
                     self.record_history(
                         "device_dispatch_held",
@@ -1223,22 +1235,22 @@ class PrintExecutionMixin:
                     )
 
                 if paused_for_device:
-                    if device_hold.can_resume(
+                    recovery_ready = device_hold.can_resume(
                         snapshot,
-                        operator_resume=self.device_resume_event.is_set(),
                         job_held=bool(reconciled.held),
-                    ):
+                    )
+                    if recovery_ready and not window.unobserved_entries(snapshot):
                         # Reconciliation above always happens before refilling.
                         paused_for_device = False
                         device_hold.resume()
-                        self.device_resume_event.set()
+                        device_resumed_at = time.monotonic()
+                        recovery_check_started = None
 
                         def clear_hold_display() -> None:
                             # Queue after enter_device_hold's UI callback so a
                             # fast connectivity recovery cannot leave a stale hold.
                             self.device_hold_active = False
                             self.device_hold_message = ""
-                            self.device_hold_connectivity_only = False
                             self.set_status("실제 인쇄 확인 중")
                             self.refresh_print_action_buttons()
 
@@ -1251,6 +1263,14 @@ class PrintExecutionMixin:
                             outstanding_tokens=[entry.token for entry in window.entries],
                         )
                     else:
+                        if recovery_ready:
+                            now = time.monotonic()
+                            if recovery_check_started is None:
+                                recovery_check_started = now
+                            elif now - recovery_check_started > run_options.device_completion_timeout_seconds:
+                                raise TimeoutError("프린터는 정상 상태지만 전송된 작업을 확인하지 못했습니다.")
+                        else:
+                            recovery_check_started = None
                         update_progress(total_jobs)
                         monitor.refresh_now()
                         last_observed_at = monitor.wait_for_change(last_observed_at, 0.5).observed_at
@@ -1258,7 +1278,7 @@ class PrintExecutionMixin:
 
                 for token, meta in tuple(outstanding.items()):
                     if (
-                        time.monotonic() - meta.submitted_at_monotonic
+                        time.monotonic() - max(meta.submitted_at_monotonic, device_resumed_at)
                         > run_options.device_completion_timeout_seconds
                     ):
                         raise TimeoutError(
@@ -1284,7 +1304,8 @@ class PrintExecutionMixin:
                 monitor.pause_full_snapshots()
                 full_snapshot_pause_active = True
                 while (
-                    device_acknowledged_prior_jobs
+                    preparation_error is None
+                    and device_acknowledged_prior_jobs
                     and window.slots_available > external_active_count
                 ):
                     self.raise_if_print_cancelled()
@@ -1298,22 +1319,31 @@ class PrintExecutionMixin:
                     if not jobs:
                         break
                     job = jobs[0]
-                    target_printer = self.route_job_printer(job, run_options.printer_name)
-                    self.assert_device_binding_for_dispatch(run_options, monitor, target_printer)
                     if not self.claim_active_print_job(job, job_index):
                         continue
                     if job.block_uid != active_block_uid:
                         active_block_uid = job.block_uid
                         self.mark_block_status(job.block_uid, "진행 중", "선전송 준비 중")
 
-                    print_path = preparation.resolve_job(job)
+                    phase = "rolling_preparation"
+                    try:
+                        target_printer = self.route_job_printer(job, run_options.printer_name)
+                        print_path = preparation.resolve_job(job)
+                        dispatch_token = services.new_dispatch_token()
+                        dispatch_path = services.prepare_dispatch_copy(
+                            print_path, services.dispatch_spool_dir, dispatch_token,
+                        )
+                    except (OSError, ValueError) as exc:
+                        if not window.outstanding_count:
+                            raise
+                        preparation_error = exc
+                        with self.print_state_lock:
+                            self.print_accepting_appends = False
+                        self.mark_block_status(job.block_uid, "오류", str(exc))
+                        self.log(f"새 전송 중단 · 이미 전송한 작업의 완료를 확인합니다: {exc}")
+                        break
+                    self.assert_device_binding_for_dispatch(run_options, monitor, target_printer)
 
-                    dispatch_token = services.new_dispatch_token()
-                    dispatch_path = services.prepare_dispatch_copy(
-                        print_path,
-                        services.dispatch_spool_dir,
-                        dispatch_token,
-                    )
                     # Audit the immutable tokenized copy passed to Sumatra,
                     # rather than a source that can change after copying.
                     job_data = job_history_data(job, target_printer, dispatch_path)
@@ -1430,8 +1460,7 @@ class PrintExecutionMixin:
                             errors=(held_message,),
                         )
                         paused_for_device = True
-                        device_hold.kind = "fault"
-                        self.device_resume_event.clear()
+                        device_hold.hold_for_fault(held_snapshot)
                         self.enter_device_hold(held_snapshot)
                         self.record_history(
                             "device_dispatch_held",
@@ -1480,6 +1509,9 @@ class PrintExecutionMixin:
                 self.preserve_retry_from_failure(job_index)
             if active_block_uid is not None and job_index < total_jobs:
                 self.mark_block_status(active_block_uid, "중지됨")
+            stopped_uid = active_block_uid if job_index < total_jobs else None
+            for uid in {meta.job.block_uid for meta in outstanding.values()} - {stopped_uid}:
+                self.mark_block_status(uid, "완료 미확인", "Canon 작업 이력을 확인해 주세요. 자동 재전송하지 않습니다.")
             self.log(str(exc))
             self.set_status("전송 중지됨" if job_index < total_jobs else "완료 확인 중지됨")
             self.set_current_work(
@@ -1503,6 +1535,8 @@ class PrintExecutionMixin:
                 self.preserve_retry_from_failure(job_index)
             if active_block_uid is not None:
                 self.mark_block_status(active_block_uid, "오류")
+            for uid in {meta.job.block_uid for meta in outstanding.values()} - {active_block_uid}:
+                self.mark_block_status(uid, "완료 미확인", "Canon 작업 이력을 확인해 주세요. 자동 재전송하지 않습니다.")
             error_message = str(exc)
             self.log(f"오류: {error_message}")
             self.set_status("오류 발생")
