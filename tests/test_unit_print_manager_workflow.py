@@ -430,7 +430,6 @@ class PrintManagerWorkflowTest(unittest.TestCase):
 
             with (
                 patch("unit_print_manager.MATERIAL_RANGE_CACHE_DIR", directory / "ranges"),
-                patch("unit_print_manager.apex_manual_page_numbers", side_effect=ValueError),
             ):
                 block = app.make_block_from_editor()
 
@@ -438,6 +437,17 @@ class PrintManagerWorkflowTest(unittest.TestCase):
             self.assertEqual((1, 5), (block.start, block.end))
             self.assertIn("(1,2,5)", block.display_label)
             self.assertEqual("차시 별", block.material_kind)
+
+    def test_common_math1_fallback_keeps_unique_source_order_for_a_lesson_range(self) -> None:
+        app = PrintManagerApp.__new__(PrintManagerApp)
+        spans = (
+            PageSpan(21, "21차시", 4, 5),
+            PageSpan(22, "22차시", 1, 2),
+            PageSpan(23, "23차시", 4, 5),
+        )
+        document = ApexDocument("APEX", "공통수학1", "교재", Path("APEX 공통수학1.pdf"), 5, (), spans)
+
+        self.assertEqual(((1, 2, 4, 5), False), app.apex_selection_pages(document, spans, None))
 
     def test_new_print_filter_excludes_blocks_with_existing_print_commands(self) -> None:
         item = ExamPdf(1, "테스트", Path("테스트.pdf"))

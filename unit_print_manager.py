@@ -26,6 +26,7 @@ from tkinter import font as tkfont
 from tkinter import BooleanVar, END, IntVar, StringVar, Text, Tk, filedialog, messagebox
 from tkinter import ttk
 
+from unit_print_catalog_search import CatalogSearch
 from pypdf import PdfReader
 from unit_print_domain import (
     AUTO_OMR_TEST_SOURCES, FIXED_FORM_SOURCES,
@@ -113,6 +114,7 @@ from unit_print_materials import (
     PageSpan,
     TrainingPackSubject,
     apex_boost_page_numbers,
+    APEX_MANUAL_LESSON_PAGE_MAP,
     apex_manual_page_numbers,
     able_document_print_settings,
     combined_span,
@@ -629,8 +631,8 @@ def complete_windows_ime_composition(window_handle: int | None = None) -> bool:
         return False
 
 
-def take_windows_ime_composition(window_handle: int | None = None) -> str:
-    """Remove and return the active Windows IME preedit string.
+def read_windows_ime_composition(window_handle: int | None = None, *, take: bool = False) -> str:
+    """Read the Windows IME preedit string, optionally taking it for immediate insertion.
 
     ``CPS_COMPLETE`` publishes the result through a later Windows message.  A
     Ctrl+Enter handler can run before Tk consumes that message, so shortcut
@@ -691,6 +693,9 @@ def take_windows_ime_composition(window_handle: int | None = None) -> str:
                     continue
                 composition = bytes(buffer.raw[:copied]).decode("utf-16-le")
 
+                if not take:
+                    return composition
+
                 cancelled = bool(
                     imm32.ImmNotifyIME(
                         input_context,
@@ -713,6 +718,10 @@ def take_windows_ime_composition(window_handle: int | None = None) -> str:
         return ""
     except Exception:
         return ""
+
+
+def take_windows_ime_composition(window_handle: int | None = None) -> str:
+    return read_windows_ime_composition(window_handle, take=True)
 
 
 def windows_shortcut_keys_pressed() -> bool:
@@ -3108,6 +3117,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.test_tabs = ttk.Notebook(test_builder, style="Material.TNotebook")
         self.test_tabs.grid(row=0, column=0, sticky="nsew")
 
+        self.catalog_search = CatalogSearch(
+            self.root, read_preedit=read_windows_ime_composition, commit_preedit=self.take_name_entry_ime,
+        )
         builder = self.create_scrollable_test_page("단원평가")
         builder.columnconfigure(1, weight=1)
         builder.columnconfigure(3, weight=1)
@@ -3116,34 +3128,29 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         )
         ttk.Label(
             builder,
-            text="과목, 레벨, 회차를 고르면 시작과 끝 범위가 채워집니다.",
+            text="검색 칸에 초성이나 번호를 입력하세요. ↑↓로 고르고 Enter로 선택합니다.",
             style="SectionHint.TLabel",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 18))
         ttk.Label(builder, text="과목", style="Field.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        self.subject_combo = ttk.Combobox(builder, textvariable=self.subject_var, state="readonly")
-        self.subject_combo.grid(row=2, column=1, columnspan=3, sticky="ew", pady=6)
+        self.subject_combo = self.catalog_search.field(builder, self.subject_var, row=2, columnspan=3, pady=6)
         ttk.Label(builder, text="레벨", style="Field.TLabel").grid(
             row=3, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        self.level_combo = ttk.Combobox(builder, textvariable=self.level_var, state="readonly")
-        self.level_combo.grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=6)
+        self.level_combo = self.catalog_search.field(builder, self.level_var, row=3, padx=(0, 10), pady=6)
         ttk.Label(builder, text="회차", style="Field.TLabel").grid(
             row=3, column=2, sticky="w", padx=(0, 8), pady=6
         )
-        self.round_combo = ttk.Combobox(builder, textvariable=self.round_var, state="readonly")
-        self.round_combo.grid(row=3, column=3, sticky="ew", pady=6)
+        self.round_combo = self.catalog_search.field(builder, self.round_var, row=3, column=3, pady=6)
         ttk.Label(builder, text="시작", style="Field.TLabel").grid(
             row=4, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        self.start_combo = ttk.Combobox(builder, textvariable=self.start_var, state="readonly")
-        self.start_combo.grid(row=4, column=1, columnspan=3, sticky="ew", pady=6)
+        self.start_combo = self.catalog_search.field(builder, self.start_var, row=4, columnspan=3, pady=6)
         ttk.Label(builder, text="끝", style="Field.TLabel").grid(
             row=5, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        self.end_combo = ttk.Combobox(builder, textvariable=self.end_var, state="readonly")
-        self.end_combo.grid(row=5, column=1, columnspan=3, sticky="ew", pady=6)
+        self.end_combo = self.catalog_search.field(builder, self.end_var, row=5, columnspan=3, pady=6)
 
         ttk.Label(builder, text="개별 파일", style="Field.TLabel").grid(
             row=6, column=0, sticky="w", padx=(0, 8), pady=6
@@ -3787,38 +3794,25 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ttk.Label(page, text="과목", style="Field.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        subject_combo = ttk.Combobox(
-            page, textvariable=variables["subject"], state="readonly"
-        )
-        subject_combo.grid(row=2, column=1, columnspan=3, sticky="ew", pady=6)
+        subject_combo = self.catalog_search.field(page, variables["subject"], row=2, columnspan=3, pady=6)
 
         filter_label_widget = ttk.Label(page, text=filter_label_text, style="Field.TLabel")
         filter_label_widget.grid(
             row=3, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        level_combo = ttk.Combobox(
-            page,
-            textvariable=variables["level"],
-            state="readonly",
-            values=filter_choices,
+        level_combo = self.catalog_search.field(
+            page, variables["level"], row=3, columnspan=3, pady=6, values=filter_choices
         )
-        level_combo.grid(row=3, column=1, columnspan=3, sticky="ew", pady=6)
 
         ttk.Label(page, text="시작", style="Field.TLabel").grid(
             row=4, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        start_combo = ttk.Combobox(
-            page, textvariable=variables["start"], state="readonly"
-        )
-        start_combo.grid(row=4, column=1, columnspan=3, sticky="ew", pady=6)
+        start_combo = self.catalog_search.field(page, variables["start"], row=4, columnspan=3, pady=6)
 
         ttk.Label(page, text="끝", style="Field.TLabel").grid(
             row=5, column=0, sticky="w", padx=(0, 8), pady=6
         )
-        end_combo = ttk.Combobox(
-            page, textvariable=variables["end"], state="readonly"
-        )
-        end_combo.grid(row=5, column=1, columnspan=3, sticky="ew", pady=6)
+        end_combo = self.catalog_search.field(page, variables["end"], row=5, columnspan=3, pady=6)
 
         ttk.Label(page, text="개별 파일", style="Field.TLabel").grid(
             row=6, column=0, sticky="w", padx=(0, 8), pady=6
@@ -4175,30 +4169,23 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ttk.Label(page, text="과목", style="FieldSoft.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        subject_combo = ttk.Combobox(page, textvariable=self.apex_subject_var, state="readonly")
-        subject_combo.grid(row=1, column=1, sticky="ew", pady=5)
+        subject_combo = self.catalog_search.field(page, self.apex_subject_var, row=1)
         ttk.Label(page, text="문서", style="FieldSoft.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        document_combo = ttk.Combobox(
-            page, textvariable=self.apex_document_kind_var, state="readonly"
-        )
-        document_combo.grid(row=2, column=1, sticky="ew", pady=5)
+        document_combo = self.catalog_search.field(page, self.apex_document_kind_var, row=2)
         ttk.Label(page, text="파트", style="FieldSoft.TLabel").grid(
             row=3, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        part_combo = ttk.Combobox(page, textvariable=self.apex_part_var, state="readonly")
-        part_combo.grid(row=3, column=1, sticky="ew", pady=5)
+        part_combo = self.catalog_search.field(page, self.apex_part_var, row=3)
         ttk.Label(page, text="시작 차시", style="FieldSoft.TLabel").grid(
             row=4, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        start_combo = ttk.Combobox(page, textvariable=self.apex_start_var, state="readonly")
-        start_combo.grid(row=4, column=1, sticky="ew", pady=5)
+        start_combo = self.catalog_search.field(page, self.apex_start_var, row=4)
         ttk.Label(page, text="끝 차시", style="FieldSoft.TLabel").grid(
             row=5, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        end_combo = ttk.Combobox(page, textvariable=self.apex_end_var, state="readonly")
-        end_combo.grid(row=5, column=1, sticky="ew", pady=5)
+        end_combo = self.catalog_search.field(page, self.apex_end_var, row=5)
         ttk.Label(page, text="개별 차시", style="FieldSoft.TLabel").grid(
             row=6, column=0, sticky="w", padx=(0, 10), pady=5
         )
@@ -4384,45 +4371,25 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ttk.Label(parent, text="과목", style="FieldSoft.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        subject_combo = ttk.Combobox(
-            parent,
-            textvariable=getattr(self, f"{prefix}_subject_var"),
-            state="readonly",
-        )
-        subject_combo.grid(row=1, column=1, sticky="ew", pady=5)
+        subject_combo = self.catalog_search.field(parent, getattr(self, f"{prefix}_subject_var"), row=1)
         setattr(self, f"{prefix}_subject_combo", subject_combo)
 
         ttk.Label(parent, text="인쇄 구성", style="FieldSoft.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        mode_combo = ttk.Combobox(
-            parent,
-            textvariable=getattr(self, f"{prefix}_mode_var"),
-            state="readonly",
-        )
-        mode_combo.grid(row=2, column=1, sticky="ew", pady=5)
+        mode_combo = self.catalog_search.field(parent, getattr(self, f"{prefix}_mode_var"), row=2)
         setattr(self, f"{prefix}_mode_combo", mode_combo)
 
         ttk.Label(parent, text="시작 차시", style="FieldSoft.TLabel").grid(
             row=3, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        start_combo = ttk.Combobox(
-            parent,
-            textvariable=getattr(self, f"{prefix}_start_var"),
-            state="readonly",
-        )
-        start_combo.grid(row=3, column=1, sticky="ew", pady=5)
+        start_combo = self.catalog_search.field(parent, getattr(self, f"{prefix}_start_var"), row=3)
         setattr(self, f"{prefix}_start_combo", start_combo)
 
         ttk.Label(parent, text="끝 차시", style="FieldSoft.TLabel").grid(
             row=4, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        end_combo = ttk.Combobox(
-            parent,
-            textvariable=getattr(self, f"{prefix}_end_var"),
-            state="readonly",
-        )
-        end_combo.grid(row=4, column=1, sticky="ew", pady=5)
+        end_combo = self.catalog_search.field(parent, getattr(self, f"{prefix}_end_var"), row=4)
         setattr(self, f"{prefix}_end_combo", end_combo)
 
         ttk.Label(parent, text="개별 차시", style="FieldSoft.TLabel").grid(
@@ -4496,32 +4463,17 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ttk.Label(parent, text="과목", style="FieldSoft.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        self.gyopyeong_subject_combo = ttk.Combobox(
-            parent,
-            textvariable=self.gyopyeong_subject_var,
-            state="readonly",
-        )
-        self.gyopyeong_subject_combo.grid(row=1, column=1, sticky="ew", pady=5)
+        self.gyopyeong_subject_combo = self.catalog_search.field(parent, self.gyopyeong_subject_var, row=1)
 
         ttk.Label(parent, text="파트", style="FieldSoft.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        self.gyopyeong_part_combo = ttk.Combobox(
-            parent,
-            textvariable=self.gyopyeong_part_var,
-            state="readonly",
-        )
-        self.gyopyeong_part_combo.grid(row=2, column=1, sticky="ew", pady=5)
+        self.gyopyeong_part_combo = self.catalog_search.field(parent, self.gyopyeong_part_var, row=2)
 
         ttk.Label(parent, text="차시", style="FieldSoft.TLabel").grid(
             row=3, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        self.gyopyeong_lesson_combo = ttk.Combobox(
-            parent,
-            textvariable=self.gyopyeong_lesson_var,
-            state="readonly",
-        )
-        self.gyopyeong_lesson_combo.grid(row=3, column=1, sticky="ew", pady=5)
+        self.gyopyeong_lesson_combo = self.catalog_search.field(parent, self.gyopyeong_lesson_var, row=3)
 
         self.gyopyeong_new_block_name_entry = self.add_new_block_name_field(
             parent,
@@ -4588,22 +4540,16 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         ttk.Label(parent, text="과목", style="FieldSoft.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        self.selected_exam_subject_combo = ttk.Combobox(
-            parent,
-            textvariable=self.selected_exam_subject_var,
-            state="readonly",
+        self.selected_exam_subject_combo = self.catalog_search.field(
+            parent, self.selected_exam_subject_var, row=1
         )
-        self.selected_exam_subject_combo.grid(row=1, column=1, sticky="ew", pady=5)
 
         ttk.Label(parent, text="차시", style="FieldSoft.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        self.selected_exam_lesson_combo = ttk.Combobox(
-            parent,
-            textvariable=self.selected_exam_lesson_var,
-            state="readonly",
+        self.selected_exam_lesson_combo = self.catalog_search.field(
+            parent, self.selected_exam_lesson_var, row=2
         )
-        self.selected_exam_lesson_combo.grid(row=2, column=1, sticky="ew", pady=5)
 
         ttk.Label(parent, text="개별 차시", style="FieldSoft.TLabel").grid(
             row=3, column=0, sticky="w", padx=(0, 10), pady=5
@@ -4695,8 +4641,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             ttk.Label(parent, text=label, style="FieldSoft.TLabel").grid(
                 row=row, column=0, sticky="w", padx=(0, 10), pady=5
             )
-            combo = ttk.Combobox(parent, textvariable=variable, state="readonly")
-            combo.grid(row=row, column=1, sticky="ew", pady=5)
+            combo = self.catalog_search.field(parent, variable, row=row)
             setattr(self, attribute, combo)
 
         ttk.Label(parent, text="개별 파트", style="FieldSoft.TLabel").grid(
@@ -4790,8 +4735,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             ttk.Label(parent, text=label, style="FieldSoft.TLabel").grid(
                 row=row, column=0, sticky="w", padx=(0, 10), pady=5
             )
-            combo = ttk.Combobox(parent, textvariable=variable, state="readonly")
-            combo.grid(row=row, column=1, sticky="ew", pady=5)
+            combo = self.catalog_search.field(parent, variable, row=row)
             setattr(self, attribute, combo)
         ttk.Label(parent, text="개별 파트", style="FieldSoft.TLabel").grid(
             row=5, column=0, sticky="w", padx=(0, 10), pady=5
@@ -4876,21 +4820,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         able.columnconfigure(1, weight=1)
         ttk.Label(able, text="A:ble", style="InsetTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(able, text="과목", style="FieldSoft.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.able_subject_combo = ttk.Combobox(able, textvariable=self.able_subject_var, state="readonly")
-        self.able_subject_combo.grid(row=1, column=1, sticky="ew", pady=5)
+        self.able_subject_combo = self.catalog_search.field(able, self.able_subject_var, row=1)
         ttk.Label(able, text="인쇄 구성", style="FieldSoft.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 10), pady=5
         )
-        self.able_document_kind_combo = ttk.Combobox(
-            able, textvariable=self.able_document_kind_var, state="readonly"
-        )
-        self.able_document_kind_combo.grid(row=2, column=1, sticky="ew", pady=5)
+        self.able_document_kind_combo = self.catalog_search.field(able, self.able_document_kind_var, row=2)
         ttk.Label(able, text="시작 차시", style="FieldSoft.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.able_start_combo = ttk.Combobox(able, textvariable=self.able_start_var, state="readonly")
-        self.able_start_combo.grid(row=3, column=1, sticky="ew", pady=5)
+        self.able_start_combo = self.catalog_search.field(able, self.able_start_var, row=3)
         ttk.Label(able, text="끝 차시", style="FieldSoft.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.able_end_combo = ttk.Combobox(able, textvariable=self.able_end_var, state="readonly")
-        self.able_end_combo.grid(row=4, column=1, sticky="ew", pady=5)
+        self.able_end_combo = self.catalog_search.field(able, self.able_end_var, row=4)
 
         ttk.Label(able, text="개별 차시", style="FieldSoft.TLabel").grid(
             row=5, column=0, sticky="w", padx=(0, 10), pady=5
@@ -5111,32 +5049,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         try:
             selected_numbers = self.selected_apex_numbers(document)
             spans = self.selected_apex_spans(document)
-            page_numbers: tuple[int, ...] = ()
-            if document.document_kind == "교재" and document.variant == "APEX Boost":
-                try:
-                    page_numbers = apex_boost_page_numbers(document.subject, (span.number for span in spans))
-                except ValueError:
-                    page_numbers = ()
-            elif document.document_kind == "교재" and document.variant == "APEX":
-                try:
-                    page_numbers = apex_manual_page_numbers(
-                        document.subject,
-                        (span.number for span in spans),
-                    )
-                except ValueError:
-                    page_numbers = ()
+            page_numbers, with_answers = self.apex_selection_pages(document, spans, selected_numbers)
             selection_label = (
                 "지정 차시 (" + ",".join(str(number) for number in selected_numbers) + ")"
                 if selected_numbers
                 else f"{len(spans)}차시" if self.apex_part_var.get() == "차시 별" else self.apex_part_var.get()
             )
             if page_numbers:
-                self.apex_status_var.set(f"{selection_label} · 본문 병합+빠른정답 {len(page_numbers)}쪽 · 세로 고정")
-            elif selected_numbers:
-                selected_page_numbers = self.apex_span_page_numbers(spans)
-                self.apex_status_var.set(
-                    f"{selection_label} · PDF {len(selected_page_numbers)}쪽 · 세로 고정"
-                )
+                contents = "본문 병합+빠른정답" if with_answers else "PDF"
+                self.apex_status_var.set(f"{selection_label} · {contents} {len(page_numbers)}쪽 · 세로 고정")
             else:
                 page_span = combined_span(spans, "선택 범위", self.apex_part_var.get())
                 self.apex_status_var.set(
@@ -5200,6 +5121,37 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             raise ValueError("선택한 APEX 차시 범위가 비어 있습니다.")
         return selected
 
+    def apex_selection_pages(
+        self,
+        document: ApexDocument,
+        spans: tuple[PageSpan, ...],
+        selected_numbers: tuple[int, ...] | None,
+    ) -> tuple[tuple[int, ...], bool]:
+        use_source_order = (
+            document.variant == "APEX"
+            and document.document_kind == "교재"
+            and document.subject in APEX_MANUAL_LESSON_PAGE_MAP
+        )
+        if document.document_kind == "교재":
+            numbers = tuple(span.number for span in spans)
+            mapped_pages = ()
+            try:
+                if document.variant == "APEX Boost":
+                    mapped_pages = apex_boost_page_numbers(document.subject, numbers)
+                elif document.variant == "APEX":
+                    mapped_pages = apex_manual_page_numbers(document.subject, numbers)
+            except ValueError:
+                pass
+            if mapped_pages and (not use_source_order or max(mapped_pages) <= document.page_count):
+                return mapped_pages, True
+
+        if use_source_order:
+            # Shared or split lesson ranges still follow the source's problem order.
+            return tuple(sorted(set(self.apex_span_page_numbers(spans)))), False
+        if selected_numbers:
+            return self.apex_span_page_numbers(spans), False
+        return (), False
+
     def make_apex_block_for_selection(
         self,
         document: ApexDocument,
@@ -5219,38 +5171,15 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             if selected_numbers
             else f"{spans[0].number:02d}~{spans[-1].number:02d}차시"
         )
-        mapped_page_numbers: tuple[int, ...] = ()
-        if document.document_kind == "교재" and document.variant == "APEX Boost":
-            try:
-                mapped_page_numbers = apex_boost_page_numbers(
-                    document.subject,
-                    (span.number for span in spans),
-                )
-            except ValueError:
-                mapped_page_numbers = ()
-        elif document.document_kind == "교재" and document.variant == "APEX":
-            try:
-                mapped_page_numbers = apex_manual_page_numbers(
-                    document.subject,
-                    (span.number for span in spans),
-                )
-            except ValueError:
-                mapped_page_numbers = ()
-        if mapped_page_numbers:
+        page_numbers, with_answers = self.apex_selection_pages(document, spans, selected_numbers)
+        if page_numbers:
+            suffix = "본문_빠른정답" if with_answers else "지정차시"
             output_path = materialize_pdf_pages(
                 document.path,
-                mapped_page_numbers,
+                page_numbers,
                 MATERIAL_RANGE_CACHE_DIR,
                 f"{document.variant}_{document.subject}_{document.document_kind}_{selection_mode}_"
-                f"{range_label}_본문_빠른정답",
-            )
-        elif selected_numbers:
-            output_path = materialize_pdf_pages(
-                document.path,
-                self.apex_span_page_numbers(spans),
-                MATERIAL_RANGE_CACHE_DIR,
-                f"{document.variant}_{document.subject}_{document.document_kind}_{selection_mode}_"
-                f"{range_label}_지정차시",
+                f"{range_label}_{suffix}",
             )
         elif selection_mode == "전체" and spans == all_spans:
             output_path = document.path
@@ -5266,7 +5195,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             f"{document.variant} / {document.subject} / {document.document_kind} / "
             f"{selection_mode} / {range_label}"
         )
-        if mapped_page_numbers:
+        if with_answers:
             display_label += " / 본문+빠른정답"
         item = ExamPdf(1, display_label, output_path)
         printer_route, printer_override = self.resolve_block_printer_route("세로")
@@ -6569,6 +6498,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
             self.gyopyeong_part_var.set("")
         if subject is not None and subject.has_full_range_only:
             self.gyopyeong_part_combo.configure(state="disabled")
+        self.catalog_search.entries[self.gyopyeong_part_combo].configure(state=(
+            "disabled" if self.gyopyeong_part_combo.instate(["disabled"]) else "normal"
+        ))
         self.refresh_gyopyeong_lesson_options()
 
     def refresh_gyopyeong_lesson_options(self) -> None:
@@ -8124,7 +8056,13 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         if self.widget_is_in_queue(event.widget):
             return self.focus_builder_area()
         if self.widget_is_in_builder(event.widget):
-            self.focus_next_in_order(self.builder_focus_widgets(), event.widget, backwards=backwards)
+            widgets = []
+            for field in self.builder_focus_widgets():
+                widgets.append(field)
+                search = self.catalog_search.entries.get(field)
+                if search is not None:
+                    widgets.append(search)
+            self.focus_next_in_order(widgets, event.widget, backwards=backwards)
             return "break"
         if self.material_dropdown_widget is not None:
             self.material_dropdown_widget = None
@@ -9008,6 +8946,8 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.root.bind_all("<FocusIn>", self.handle_global_focus_in, add="+")
         self.root.bind_all("<ButtonPress-1>", self.handle_global_pointer, add="+")
         self.root.bind("<Activate>", self.handle_app_activate, add="+")
+        for entry in self.catalog_search.entries.values():
+            self.bind_workspace_tab(entry)
         self.bind_material_keyboard_controls()
         self.bind_workspace_navigation_controls()
         self.text_shortcuts = TextShortcutBindings(self.root)

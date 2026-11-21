@@ -54,7 +54,7 @@ APP_FILES = (
     "unit_print_instance.py",
     "unit_print_manager.py",
     "unit_print_theme.py",
-    "unit_print_typography.py",
+    "unit_print_typography.py", "unit_print_catalog_search.py",
     "unit_print_preview.py",
     "unit_print_domain.py",
     "unit_print_execution.py",

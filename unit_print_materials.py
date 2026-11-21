@@ -691,14 +691,8 @@ def apex_manual_page_numbers(subject: str, lesson_numbers: Iterable[int]) -> tup
         for row in selected_rows
         for page_range in row.page_ranges
     )
-    answer_pages: list[int] = []
-    seen_pages = set(body_pages)
-    for row in selected_rows:
-        for page in row.answer_pages:
-            if page not in seen_pages:
-                answer_pages.append(page)
-                seen_pages.add(page)
-    return body_pages + tuple(answer_pages)
+    answer_pages = {page for row in selected_rows for page in row.answer_pages}
+    return body_pages + tuple(sorted(answer_pages.difference(body_pages)))
 
 
 @dataclass(frozen=True, slots=True)

@@ -162,13 +162,17 @@ class KeyboardWorkflowTests(unittest.TestCase):
         app.focus_builder_area.assert_not_called()
         app.focus_queue_canvas.assert_not_called()
 
-    def test_builder_tab_preserves_standard_field_order(self):
+    def test_builder_tab_includes_the_adjacent_search_field_then_the_next_selector(self):
         app = self.app()
         controls = [Mock() for _ in range(2)]
+        search = Mock()
+        app.catalog_search = SimpleNamespace(entries={controls[0]: search})
         app.widget_is_in_queue.return_value = False
         app.widget_is_in_builder.return_value = True
         app.builder_focus_widgets = Mock(return_value=controls)
         app.handle_workspace_tab(event(controls[0], "Tab"))
+        search.focus_set.assert_called_once_with()
+        app.handle_workspace_tab(event(search, "Tab"))
         controls[1].focus_set.assert_called_once_with()
         app.handle_workspace_tab(event(controls[0], "ISO_Left_Tab", 1))
         self.assertEqual(2, controls[1].focus_set.call_count)

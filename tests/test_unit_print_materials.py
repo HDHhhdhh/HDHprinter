@@ -249,6 +249,20 @@ class ApexManualLessonPageMapTest(unittest.TestCase):
 
         self.assertEqual(expected, apex_manual_page_numbers("공통수학1", (5, 6, 7, 8)))
 
+    def test_common_math1_problem_and_answer_order_ignores_lesson_input_order(self) -> None:
+        expected = (*range(35, 51), *range(55, 60), *range(99, 140), 264, 265, 266, 268, 269, 270)
+        self.assertEqual(expected, apex_manual_page_numbers("공통수학1", (23, 10, 22, 21, 7)))
+        self.assertEqual((*range(99, 140), 268, 269, 270),
+                         apex_manual_page_numbers("공통수학1", (21, 22, 23)))
+
+    def test_other_apex_textbooks_keep_unique_page_order_for_reversed_selection(self) -> None:
+        for subject in ("공통수학2", "대수", "미적분1"):
+            with self.subTest(subject=subject):
+                numbers = tuple(span.number for span in apex_manual_lesson_page_spans(subject))
+                expected = apex_manual_page_numbers(subject, numbers)
+                self.assertEqual(tuple(sorted(set(expected))), expected)
+                self.assertEqual(expected, apex_manual_page_numbers(subject, reversed(numbers)))
+
     def test_common_math1_preserves_a_split_lesson_page_gap(self) -> None:
         expected = tuple(range(51, 58)) + tuple(range(60, 63)) + (265, 266)
 
