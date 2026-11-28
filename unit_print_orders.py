@@ -8,10 +8,28 @@ those rows through the same block builders used by the interactive UI.
 from __future__ import annotations
 
 import csv
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def order_downloads_directory() -> Path:
+    """Use the Windows Downloads location, including redirected folders."""
+    if os.name == "nt":
+        import winreg
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")
+            return Path(os.path.expandvars(value))
+        except OSError:
+            pass
+    return Path.home() / "Downloads"
 
 
 ORDER_CSV_HEADERS = (

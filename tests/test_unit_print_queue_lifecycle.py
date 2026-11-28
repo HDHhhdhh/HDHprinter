@@ -121,6 +121,45 @@ class QueueLifecycleTests(unittest.TestCase):
         self.assertEqual([late, first], app.blocks)
         self.assertFalse(app.undo_stack)
 
+    def test_clear_completed_preserves_remaining_selection_and_can_be_undone(self):
+        done, waiting, uncertain = map(block, ("done", "waiting", "uncertain"))
+        app = make_app([done, waiting, uncertain])
+        app.block_status_by_id = {id(done): "완료", id(uncertain): "완료 미확인"}
+        app.block_detail_by_id[id(done)] = "실제 인쇄 완료"
+        app.selected_block_indices = {0, 2}
+        app.selected_block_index_value = app.queue_selection_anchor = 2
+
+        app.clear_completed_blocks()
+
+        self.assertEqual([waiting, uncertain], app.blocks)
+        self.assertEqual({1}, app.selected_block_indices)
+        self.assertEqual(1, app.selected_block_index_value)
+        self.assertEqual(1, app.queue_selection_anchor)
+        self.assertNotIn(id(done), app.block_detail_by_id)
+        app.undo_last_action()
+        self.assertEqual([done, waiting, uncertain], app.blocks)
+        self.assertEqual("완료", app.queue_block_status(done))
+
+    def test_clear_completed_during_print_preserves_dispatch_and_late_updates(self):
+        done, sent, reserved = map(block, ("done", "sent", "reserved"))
+        app = make_app([done, sent, reserved])
+        app.is_printing = True
+        app.block_status_by_id = {id(done): "완료", id(sent): "완료", id(reserved): "예약"}
+        app.block_detail_by_id[id(done)] = "실제 인쇄 완료"
+        app.print_pending_jobs = app.build_print_jobs(app.blocks)
+        app.print_scheduled_block_ids = {id(item) for item in app.blocks}
+        jobs = tuple(app.print_pending_jobs)
+        scheduled = set(app.print_scheduled_block_ids)
+
+        app.clear_completed_blocks()
+        app.mark_block_status(id(done), "완료", "실제 인쇄 완료")
+
+        self.assertEqual([sent, reserved], app.blocks)
+        self.assertEqual(jobs, tuple(app.print_pending_jobs))
+        self.assertEqual(scheduled, app.print_scheduled_block_ids)
+        self.assertNotIn(id(done), app.block_status_by_id)
+        self.assertFalse(app.undo_stack)
+
     def test_append_excludes_previous_completed_and_failed_blocks(self):
         completed, active, new, failed = [block(name) for name in ("done", "active", "new", "failed")]
         app = make_app([completed, active, new, failed])

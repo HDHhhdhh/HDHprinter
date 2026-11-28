@@ -943,6 +943,8 @@ class PrintExecutionMixin:
         """Reset shared worker state after completion, stop, or failure."""
 
         with self.print_state_lock:
+            cleared_blocks = getattr(self, "_cleared_active_completed_blocks", ())
+            self._cleared_active_completed_blocks = []
             self.print_accepting_appends = False
             self.print_pending_jobs = []
             self.print_scheduled_block_ids = set()
@@ -956,7 +958,14 @@ class PrintExecutionMixin:
         self.is_printing = False
         self.print_thread = None
         self.history_run_id = None
-        self.root.after(0, self.refresh_print_action_buttons)
+
+        def refresh_after_run() -> None:
+            # Keep removed block IDs alive until previously queued UI updates run.
+            self.refresh_print_action_buttons()
+            if cleared_blocks:
+                cleared_blocks.clear()
+
+        self.root.after(0, refresh_after_run)
 
     def print_blocks_device_rolling(
         self,

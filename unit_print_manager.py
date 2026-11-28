@@ -218,6 +218,7 @@ from unit_print_orders import (
     OrderRow,
     load_order_csv,
     name_separator_order_key,
+    order_downloads_directory,
     parse_order_number_list,
     write_order_csv_template,
 )
@@ -1372,6 +1373,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.blank_review_status_var = StringVar(value="")
         self.omr_copies_var = IntVar(value=1)
         self.omr_status_var = StringVar(value="")
+        self.order_tab_selected = False
+        self.order_csv_choosing = False
+        self.order_imported_rows: set[tuple[OrderRow, ...]] = set()
         self.order_csv_path: Path | None = None
         self.order_csv_result = OrderCsvResult((), (), "")
         self.order_csv_status_var = StringVar(value="CSV 주문서를 선택해 주세요.")
@@ -3404,6 +3408,7 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.register_custom_drop_target(custom)
 
         order_builder = ttk.Frame(self.builder_notebook, style="Panel.TFrame", padding=(20, 18))
+        self.order_builder = order_builder
         self.builder_notebook.add(order_builder, text="대량주문서")
         order_builder.columnconfigure(0, weight=1)
         ttk.Label(order_builder, text="대량 주문서", style="SectionTitle.TLabel").grid(
@@ -3527,10 +3532,9 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         )
         queue_button_row = ttk.Frame(queue_head, style="Surface.TFrame")
         queue_button_row.grid(row=0, column=1, rowspan=2, sticky="e")
-        ttk.Button(queue_button_row, text="위로", style="SoftAction.TButton", command=lambda: self.move_selected_block(-1)).pack(side="left", padx=(0, 5))
-        ttk.Button(queue_button_row, text="아래로", style="SoftAction.TButton", command=lambda: self.move_selected_block(1)).pack(side="left", padx=(0, 5))
         ttk.Button(queue_button_row, text="가나다 정렬", style="SoftAction.TButton", command=self.sort_blocks_by_name).pack(side="left", padx=(0, 5))
         ttk.Button(queue_button_row, text="삭제", style="DangerAction.TButton", command=self.delete_selected_block).pack(side="left", padx=(0, 5))
+        ttk.Button(queue_button_row, text="완료 비우기", style="SoftAction.TButton", command=self.clear_completed_blocks).pack(side="left", padx=(0, 5))
         ttk.Button(queue_button_row, text="전체 비우기", style="SoftAction.TButton", command=self.clear_blocks).pack(side="left", padx=(0, 5))
         self.queue_tools_button = ttk.Button(queue_button_row, text="큐 도구", style="SoftAction.TButton", command=self.show_queue_tools_menu)
         self.queue_tools_button.pack(side="left")
@@ -6908,6 +6912,11 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.keyboard_state.enter_builder(tab=self.keyboard_state.builder_tab)
         self.refresh_name_separator_editor_state()
         self.refresh_shortcut_help()
+        on_orders = self.builder_notebook.select() == str(self.order_builder)
+        entered_orders = on_orders and not self.order_tab_selected
+        self.order_tab_selected = on_orders
+        if entered_orders:
+            self.root.after_idle(self.open_order_csv_on_tab_entry)
 
     def handle_test_tab_changed(self, _event: tk.Event) -> None:
         try:
@@ -9171,16 +9180,51 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.complete_block_commit(token, commit)
         return True
 
-    def choose_order_csv(self) -> None:
-        selected = filedialog.askopenfilename(
-            title="대량 주문서 CSV 선택",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not selected:
+    def open_order_csv_on_tab_entry(self) -> None:
+        if not self.is_closing and self.order_tab_selected:
+            self.choose_order_csv(auto_select=True)
+
+    def choose_order_csv(self, *, auto_select: bool = False) -> None:
+        if self.order_csv_choosing or self.order_build_pending or not self.save_pending_queue_editor():
             return
-        self.order_csv_path = Path(selected)
-        self.order_csv_result = load_order_csv(self.order_csv_path)
+        self.order_csv_choosing = True
+        try:
+            downloads = order_downloads_directory()
+            if auto_select:
+                try:
+                    matches = [
+                        path for path in downloads.iterdir()
+                        if path.name.startswith("빠른인쇄기_")
+                        and path.suffix.casefold() == ".csv"
+                        and path.name != "빠른인쇄기_대량주문서_양식.csv"
+                        and path.is_file()
+                    ]
+                except OSError:
+                    matches = []
+                if len(matches) == 1:
+                    result = load_order_csv(matches[0])
+                    if not result.issues and result.rows in self.order_imported_rows:
+                        self.order_csv_status_var.set("이미 추가한 주문서입니다. 다시 가져오려면 CSV 선택을 누르세요.")
+                        return
+                    self.import_order_csv(matches[0], result)
+                    return
+
+            selected = filedialog.askopenfilename(
+                parent=self.root,
+                title="대량 주문서 CSV 선택",
+                initialdir=str(downloads),
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            )
+            if selected:
+                self.import_order_csv(Path(selected), load_order_csv(Path(selected)))
+        finally:
+            self.order_csv_choosing = False
+
+    def import_order_csv(self, path: Path, result: OrderCsvResult) -> None:
+        self.order_csv_path = path
+        self.order_csv_result = result
         self.refresh_order_csv_list()
+        self.add_order_csv_blocks()
 
     def save_order_csv_template(self) -> None:
         selected = filedialog.asksaveasfilename(
@@ -9564,23 +9608,36 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         *,
         source_name: str,
         clear_source: bool,
-    ) -> None:
-        blocks.sort(key=lambda block: name_separator_order_key(block.name_separator_label))
+        imported_rows: tuple[OrderRow, ...],
+    ) -> bool:
+        if not self.save_pending_queue_editor():
+            self.order_csv_status_var.set("수정 중인 블록을 저장한 뒤 주문서를 다시 추가하세요.")
+            return False
+        keep_existing_order = self.is_printing or self.retry_batch is not None
         self.push_undo_state("대량 주문서 블록 추가")
-        self.blocks.extend(blocks)
+        if keep_existing_order:
+            blocks.sort(key=lambda block: name_separator_order_key(block.name_separator_label))
+            self.blocks.extend(blocks)
+            select_index = len(self.blocks) - 1
+            sort_status = "새 블록만 가나다순"
+        else:
+            self.blocks.extend(blocks)
+            self.blocks.sort(key=lambda block: name_separator_order_key(block.name_separator_label))
+            last_added = id(blocks[-1])
+            select_index = next(index for index, block in enumerate(self.blocks) if id(block) == last_added)
+            sort_status = "작업 큐 가나다순"
+        self.order_imported_rows.add(imported_rows)
         if any(block.name_separator_label for block in blocks):
             self.name_separator_page_var.set(True)
         for block in blocks:
             self.block_status_by_id[id(block)] = "대기"
-        self.update_queue_view(select_index=len(self.blocks) - 1)
+        self.update_queue_view(select_index=select_index)
         self.update_preview()
-        self.log(
-            f"대량 주문서 추가: {source_name} / 블록 {len(blocks)}개 / "
-            "이름 구분지 가나다순"
-        )
+        self.log(f"대량 주문서 추가: {source_name} / 블록 {len(blocks)}개 / {sort_status}")
         if clear_source:
             self.clear_order_csv()
-            self.order_csv_status_var.set(f"{len(blocks)}개 추가 완료 · 작업 큐에서 Ctrl+Z로 취소")
+            self.order_csv_status_var.set(f"{len(blocks)}개 추가 완료 · {sort_status}")
+        return True
 
     def add_order_csv_blocks(self) -> bool:
         if getattr(self, "order_build_pending", False):
@@ -9605,12 +9662,12 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 return False
             order_path = getattr(self, "order_csv_path", None)
             source_name = order_path.name if order_path is not None else "주문서"
-            self.commit_order_csv_blocks(
+            return self.commit_order_csv_blocks(
                 blocks,
                 source_name=source_name,
                 clear_source=True,
+                imported_rows=result.rows,
             )
-            return True
         captured_path = self.order_csv_path
         captured_root = self.root_path
         captured_printer = self.printer_var.get()
@@ -9676,13 +9733,22 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
                 self.commit_order_csv_blocks(
                     blocks,
                     source_name=source_name,
+                    imported_rows=result.rows,
                     clear_source=(
                         self.order_csv_result is result
                         and self.order_csv_path == captured_path
                     ),
                 )
 
-            self.complete_block_commit(token, commit)
+            def commit_when_ready() -> None:
+                if self.is_closing or epoch != self.block_preparation_epoch:
+                    return
+                if getattr(self, "_print_preparation_request", None) is not None:
+                    self.root.after(100, commit_when_ready)
+                    return
+                self.complete_block_commit(token, commit)
+
+            commit_when_ready()
 
         try:
             self.submit_background_block_build(work, finish, epoch=epoch)
@@ -10821,6 +10887,10 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
 
     def mark_block_status(self, block_uid: int, status: str, detail: str = "") -> None:
         def update() -> None:
+            if block_uid not in self.block_status_by_id and not any(
+                id(block) == block_uid for block in self.blocks
+            ):
+                return
             status_changed = self.block_status_by_id.get(block_uid) != status
             detail_changed = False
             if detail:
@@ -12752,6 +12822,53 @@ class PrintManagerApp(PrintHistoryMixin, PrintExecutionMixin):
         self.update_preview()
         active_note = f" · 미전송 {len(removed_jobs)}건 취소" if removed_jobs else ""
         self.log(f"블록 삭제: {removed.summary}{active_note}")
+
+    def clear_completed_blocks(self) -> None:
+        if getattr(self, "_print_preparation_request", None) is not None:
+            self.queue_status_var.set("인쇄 준비가 끝난 뒤 완료 블록을 비울 수 있습니다.")
+            return
+        if not self.save_pending_queue_editor():
+            return
+        retry = self.retry_batch
+        retry_ids = {job.block_uid for job in retry.jobs} if retry is not None else set()
+        removed_ids = {
+            id(block) for block in self.blocks
+            if id(block) not in retry_ids
+            and self.queue_block_status(block) == "완료"
+            and (not self.is_printing or self.queue_block_status_label(block) == "인쇄 완료")
+        }
+        if not removed_ids:
+            self.queue_status_var.set("비울 수 있는 완료 블록이 없습니다.")
+            return
+
+        self.push_undo_state("완료 블록 비우기")
+        if self.is_printing:
+            with self.print_state_lock:
+                # Dispatch jobs still use id(block) until the run ends.
+                retained = [block for block in self.blocks
+                            if id(block) in removed_ids and id(block) in self.print_scheduled_block_ids]
+                if retained:
+                    previous = getattr(self, "_cleared_active_completed_blocks", [])
+                    self._cleared_active_completed_blocks = previous + retained
+        new_index_by_old = {}
+        remaining = []
+        for index, block in enumerate(self.blocks):
+            uid = id(block)
+            if uid in removed_ids:
+                self.block_status_by_id.pop(uid, None)
+                self.block_detail_by_id.pop(uid, None)
+            else:
+                new_index_by_old[index] = len(remaining)
+                remaining.append(block)
+        self.blocks[:] = remaining
+        self.selected_block_indices = {
+            new_index_by_old[index] for index in self.selected_block_indices if index in new_index_by_old
+        }
+        self.selected_block_index_value = new_index_by_old.get(self.selected_block_index_value)
+        self.queue_selection_anchor = new_index_by_old.get(getattr(self, "queue_selection_anchor", None))
+        self.update_queue_view()
+        self.update_preview()
+        self.log(f"완료 블록 {len(removed_ids)}개 비우기")
 
     def clear_blocks(self) -> None:
         able_pending = getattr(self, "able_build_pending", False)

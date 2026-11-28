@@ -353,6 +353,9 @@ class OrderBlockTests(unittest.TestCase):
         app.order_csv_status_var = FakeVariable("")
         app.order_csv_add_button = Mock()
         app.order_csv_path = Path("orders.csv")
+        app.order_imported_rows = set()
+        app.is_printing = False
+        app.retry_batch = None
         app.blocks = []
         app.block_status_by_id = {}
         app.name_separator_page_var = FakeVariable(False)
@@ -400,6 +403,9 @@ class OrderBlockTests(unittest.TestCase):
         app.order_csv_result = OrderCsvResult(rows, (), "utf-8-sig")
         app.order_csv_status_var = FakeVariable("")
         app.order_csv_path = Path("orders.csv")
+        app.order_imported_rows = set()
+        app.is_printing = False
+        app.retry_batch = None
         app.blocks = [existing]
         app.block_status_by_id = {id(existing): "대기"}
         app.name_separator_page_var = FakeVariable(False)
@@ -416,13 +422,59 @@ class OrderBlockTests(unittest.TestCase):
 
         self.assertTrue(added)
         self.assertEqual(
-            [existing, kim_first, kim_second, yun, unnamed],
+            [kim_first, kim_second, yun, existing, unnamed],
             app.blocks,
         )
         self.assertTrue(app.name_separator_page_var.get())
-        app.update_queue_view.assert_called_once_with(select_index=4)
+        app.update_queue_view.assert_called_once_with(select_index=1)
         app.log.assert_called_once()
-        self.assertIn("이름 구분지 가나다순", app.log.call_args.args[0])
+        self.assertIn("작업 큐 가나다순", app.log.call_args.args[0])
+
+        for printing, retry in ((True, None), (False, object())):
+            with self.subTest(printing=printing):
+                app.is_printing = printing
+                app.retry_batch = retry
+                app.blocks = [existing]
+                app.add_order_csv_blocks()
+                self.assertEqual([existing, kim_first, kim_second, yun, unnamed], app.blocks)
+                self.assertIn("새 블록만 가나다순", app.log.call_args.args[0])
+
+    def test_order_tab_selects_one_matching_file_or_opens_downloads_picker(self) -> None:
+        app = PrintManagerApp.__new__(PrintManagerApp)
+        app.root = Mock()
+        app.order_csv_choosing = app.order_build_pending = False
+        app.order_imported_rows = set()
+        app.order_csv_status_var = FakeVariable("")
+        app.refresh_order_csv_list = Mock()
+        app.add_order_csv_blocks = Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            downloads = Path(folder)
+            first = downloads / "빠른인쇄기_주문.CSV"
+            second = downloads / "빠른인쇄기_주문 (1).csv"
+            result = OrderCsvResult((order_row(),), (), "utf-8")
+            with (
+                patch("unit_print_manager.order_downloads_directory", return_value=downloads),
+                patch("unit_print_manager.load_order_csv", return_value=result) as load,
+                patch("unit_print_manager.filedialog.askopenfilename", return_value="") as chooser,
+            ):
+                app.choose_order_csv(auto_select=True)
+                self.assertEqual(str(downloads), chooser.call_args.kwargs["initialdir"])
+                app.add_order_csv_blocks.assert_not_called()
+                chooser.reset_mock()
+                first.touch()
+                app.choose_order_csv(auto_select=True)
+                chooser.assert_not_called()
+                load.assert_called_once_with(first)
+                app.add_order_csv_blocks.assert_called_once_with()
+                app.order_imported_rows.add(result.rows)
+                app.choose_order_csv(auto_select=True)
+                app.add_order_csv_blocks.assert_called_once_with()
+                second.touch()
+                chooser.return_value = str(second)
+                app.choose_order_csv(auto_select=True)
+                chooser.assert_called_once()
+                self.assertEqual(second, app.order_csv_path)
+                self.assertEqual(2, app.add_order_csv_blocks.call_count)
 
 
 if __name__ == "__main__":

@@ -159,12 +159,14 @@ class UiPerformanceTests(unittest.TestCase):
 
     def test_repeated_block_progress_skips_full_queue_redraw(self) -> None:
         app = PrintManagerApp.__new__(PrintManagerApp)
+        block = object()
+        app.blocks = [block]
         app.block_status_by_id = {}
         app.block_detail_by_id = {}
         app.draw_queue = Mock()
 
-        app.mark_block_status(101, "진행 중", "실제 완료 0/20")
-        app.mark_block_status(101, "진행 중", "실제 완료 0/20")
+        app.mark_block_status(id(block), "진행 중", "실제 완료 0/20")
+        app.mark_block_status(id(block), "진행 중", "실제 완료 0/20")
 
         app.draw_queue.assert_called_once_with()
 
